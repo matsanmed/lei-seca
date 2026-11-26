@@ -89,21 +89,27 @@
     ::-webkit-scrollbar-thumb:hover {
       background: rgba(148, 163, 184, 0.55);
     }
+
+    /* Destaque temporário ao saltar para um artigo pelo atalho "Ir para Art." */
+    @keyframes jumpPulse {
+      0% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.65); }
+      70% { box-shadow: 0 0 0 10px rgba(99, 102, 241, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); }
+    }
+    .article-jump-highlight {
+      border-color: #6366f1 !important;
+      animation: jumpPulse 1.1s ease-out 2;
+    }
   </style>
 </head>
 
-<body class="bg-[#f8f9fb] text-slate-800 dark:bg-slate-950 dark:text-slate-100 transition-colors duration-200 overflow-x-hidden min-h-screen">
+<body class="bg-[#f8f9fb] text-slate-800 dark:bg-[#0b1120] dark:text-slate-100 transition-colors duration-200 overflow-x-hidden min-h-screen">
 
-  <!--
-    SEGURANÇA E PRIVACIDADE:
-    Antes da confirmação de login pelo Firebase Auth, nenhum elemento do app,
-    menu, lei ou anotação existe no DOM. Todo o conteúdo é montado em #root
-    somente após a autenticação bem-sucedida e destruído ao clicar em "Sair".
-  -->
-  <div id="root" class="min-h-screen"></div>
+  <!-- Contêiner principal (permanece vazio até a autenticação verificada pelo Firebase Auth) -->
+  <div id="root"></div>
 
-  <!-- Container global de notificações Toast (nunca usa alert()) -->
-  <div id="toastContainer" class="fixed bottom-4 right-4 z-[70] flex flex-col gap-2 max-w-xs sm:max-w-sm pointer-events-none"></div>
+  <!-- Contêiner global de notificações Toast -->
+  <div id="toastContainer" class="fixed bottom-4 right-4 z-[70] flex flex-col gap-2 pointer-events-none max-w-sm"></div>
 
   <!-- ===================================================================== -->
   <!-- MÓDULO PRINCIPAL: FIREBASE v11.6.0 (CDN) + APP PRIVADO DE LEI SECA    -->
@@ -139,8 +145,7 @@
       projectId: "lei-seca-studio",
       storageBucket: "lei-seca-studio.firebasestorage.app",
       messagingSenderId: "279777905734",
-      appId: "1:279777905734:web:37d0c6d624f791c97e4e47",
-      measurementId: "G-LC4L9FQY27"
+      appId: "1:279777905734:web:37d0c6d624f791c97e4e47"
     };
 
     const APP_ID = 'lei-seca-studio';
@@ -153,6 +158,7 @@
     // 2. CAMINHOS ESTRITOS DE ISOLAMENTO NO CLOUD FIRESTORE
     //    - Metadados e preferências: artifacts/lei-seca-studio/users/{uid}/meta/workspace
     //    - Leis individuais:         artifacts/lei-seca-studio/users/{uid}/laws/{lawId}
+    //    - Blocos de leis grandes:   artifacts/lei-seca-studio/users/{uid}/laws/{lawId}/chunks/chunk_{index}
     // -----------------------------------------------------------------------
     function workspaceDocRef(uid) {
       return doc(db, 'artifacts', APP_ID, 'users', uid, 'meta', 'workspace');
@@ -163,10 +169,22 @@
     function lawDocRef(uid, lawId) {
       return doc(db, 'artifacts', APP_ID, 'users', uid, 'laws', lawId);
     }
+    function lawChunksCollectionRef(uid, lawId) {
+      return collection(db, 'artifacts', APP_ID, 'users', uid, 'laws', lawId, 'chunks');
+    }
+    function lawChunkDocRef(uid, lawId, index) {
+      return doc(db, 'artifacts', APP_ID, 'users', uid, 'laws', lawId, 'chunks', `chunk_${index}`);
+    }
 
     // -----------------------------------------------------------------------
     // 3. ESTADO EM MEMÓRIA (NUNCA USA localStorage — APENAS FIRESTORE)
     // -----------------------------------------------------------------------
+    const INITIAL_VISIBLE_ARTICLES = 40;
+    const LOAD_MORE_STEP = 50;
+    const CHUNK_TARGET_BYTES = 350000;     // 350 KB por bloco (bem abaixo de 1.048.576 bytes)
+    const SINGLE_CHUNK_MAX_BYTES = 500000; // 500 KB máximo para edição rápida de 1 chunk
+    const MAX_BATCH_OPS = 200;
+
     let currentUser = null;
     let unsubWorkspace = null;
     let unsubActiveLaw = null;
@@ -176,7 +194,7 @@
     // Metadados do workspace sincronizados em tempo real
     let workspace = {
       preferences: {
-        darkMode: false,
+        darkMode: true,
         fontSize: 16,
         fontFamily: 'sans', // 'sans' | 'serif'
         activeSubjectId: '',
@@ -186,32 +204,38 @@
       lawIndex: []  // [{ id, subjectId, shortName, title, subtitle, order, articleCount }]
     };
 
-    // Documento completo da lei atualmente aberta
+    // Documento completo da lei atualmente aberta (com mapa de chunks se fragmentada)
     let activeLawDoc = null;
 
     // Estados efêmeros da interface
     let searchQuery = '';
+    let searchDebounceTimer = null;
     let filterAnnotatedOnly = false;
     let filterModsOnly = false;
+    let visibleArticlesLimit = INITIAL_VISIBLE_ARTICLES;
     let editingArticleId = null;
     let openNotes = new Set();
     let openMods = new Set();
     let openModForms = new Set();
     let pendingConfirmCallback = null;
     let renameTargetSubjectId = null;
+    let lastJumpKey = '';
+    let lastJumpMatchCursor = -1;
 
-    // Controle de auto-save (debounce de 600ms)
+    // Controle de auto-save (debounce de 600ms) e edição rápida de chunk
     let lawSaveTimer = null;
     let workspaceSaveTimer = null;
     let pendingWrites = 0;
     let hasLocalUnsavedLawChanges = false;
+    let dirtyArticleIds = new Set();
+    let lastSavedLawSignature = '';
     let firestorePermissionError = '';
 
     // -----------------------------------------------------------------------
-    // 4. SANITIZAÇÃO RIGOROSA CONTRA XSS (DOMParser + WHITELIST ESTRITA)
+    // 4. SANITIZAÇÃO RIGOROSA CONTRA XSS E OTIMIZAÇÃO DE ARMAZENAMENTO
     // -----------------------------------------------------------------------
     const ALLOWED_TAGS = new Set([
-      'B', 'STRONG', 'I', 'EM', 'U', 'S', 'STRIKE', 'SPAN', 'MARK',
+      'B', 'STRONG', 'I', 'EM', 'U', 'S', 'STRIKE', 'DEL', 'SPAN', 'MARK',
       'BR', 'P', 'DIV', 'UL', 'OL', 'LI'
     ]);
     const BLOCKED_TAGS_WITH_BODY = new Set([
@@ -362,6 +386,61 @@
 
     function generateId(prefix = 'id') {
       return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    }
+
+    /**
+     * Calcula o tamanho exato em bytes UTF-8 de um objeto serializado em JSON.
+     */
+    function getUtf8ByteSize(obj) {
+      return new TextEncoder().encode(JSON.stringify(obj)).length;
+    }
+
+    /**
+     * Otimiza um artigo para gravação no Firestore:
+     * - Omite originalHtml quando o artigo ainda é idêntico ao original (~50% menor)
+     * - Omite note quando vazio
+     * - Omite modifications quando vazio
+     * - Omite sectionHeader quando vazio
+     */
+    function serializeArticleForStorage(art) {
+      const cleanHtml = sanitizeHtml(art.html || '');
+      const cleanOrig = sanitizeHtml(art.originalHtml != null ? art.originalHtml : cleanHtml);
+      const compact = {
+        id: art.id || generateId('art'),
+        number: String(art.number || ''),
+        html: cleanHtml
+      };
+      if (art.sectionHeader && String(art.sectionHeader).trim()) {
+        compact.sectionHeader = String(art.sectionHeader).trim();
+      }
+      if (cleanOrig !== cleanHtml) {
+        compact.originalHtml = cleanOrig;
+      }
+      const noteText = String(art.note ?? art.notes ?? '');
+      if (noteText.trim().length > 0) {
+        compact.note = noteText;
+      }
+      if (Array.isArray(art.modifications) && art.modifications.length > 0) {
+        compact.modifications = art.modifications;
+      }
+      return compact;
+    }
+
+    /**
+     * Hidrata um artigo vindo do Firestore para memória (compatível com formato antigo e compacto).
+     */
+    function hydrateArticleFromStorage(raw) {
+      const cleanHtml = sanitizeHtml(raw?.html || '');
+      const cleanOrig = raw?.originalHtml != null ? sanitizeHtml(raw.originalHtml) : cleanHtml;
+      return {
+        id: raw?.id || generateId('art'),
+        number: String(raw?.number || ''),
+        sectionHeader: String(raw?.sectionHeader || ''),
+        originalHtml: cleanOrig,
+        html: cleanHtml,
+        note: String(raw?.note ?? raw?.notes ?? ''),
+        modifications: Array.isArray(raw?.modifications) ? raw.modifications : []
+      };
     }
 
     // -----------------------------------------------------------------------
@@ -900,33 +979,24 @@
     function renderAuthLoading() {
       document.title = 'Lei Seca Studio — Verificando acesso...';
       document.getElementById('root').innerHTML = `
-        <div class="min-h-screen flex flex-col items-center justify-center p-6 bg-[#f8f9fb] dark:bg-slate-950">
-          <div class="w-11 h-11 rounded-2xl bg-indigo-600 text-white flex items-center justify-center shadow-md mb-4">
-            <svg class="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
-              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3"></circle>
-              <path class="opacity-90" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
-            </svg>
+        <main class="min-h-screen flex items-center justify-center p-4 bg-slate-100 dark:bg-[#0b1120]">
+          <div class="flex flex-col items-center gap-3 text-center">
+            <div class="w-10 h-10 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
+            <p class="text-sm font-medium text-slate-600 dark:text-slate-300">Verificando sessão segura...</p>
           </div>
-          <p class="text-sm font-semibold text-slate-700 dark:text-slate-300">Verificando sessão privada...</p>
-        </div>
+        </main>
       `;
     }
 
-    /**
-     * Renderiza exclusivamente a tela de login privada.
-     * Nenhum elemento do aplicativo ou dado legal existe no DOM neste estado.
-     */
     function renderPrivateLoginScreen(errorMessage = '') {
       document.title = 'Lei Seca Studio — Acesso Privado';
       document.documentElement.classList.remove('dark');
-
       document.getElementById('root').innerHTML = `
-        <main class="min-h-screen flex items-center justify-center p-4 sm:p-6 bg-gradient-to-br from-slate-100 via-indigo-50/35 to-slate-100">
-          <div class="w-full max-w-md bg-white border border-slate-200/90 rounded-3xl shadow-xl overflow-hidden">
-
-            <div class="px-6 sm:px-8 pt-8 pb-5 text-center border-b border-slate-100">
-              <div class="w-14 h-14 mx-auto rounded-2xl bg-indigo-600 text-white flex items-center justify-center shadow-md mb-4">
-                <svg class="w-7 h-7" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <main class="min-h-screen flex items-center justify-center p-4 sm:p-6 bg-gradient-to-br from-slate-100 via-indigo-50/40 to-slate-200">
+          <div class="w-full max-w-md rounded-3xl bg-white border border-slate-200/90 shadow-2xl overflow-hidden">
+            <div class="px-6 sm:px-8 pt-8 pb-6 bg-slate-50/80 border-b border-slate-100 text-center">
+              <div class="w-12 h-12 mx-auto mb-3.5 rounded-2xl bg-indigo-600 text-white flex items-center justify-center shadow-md">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
                 </svg>
               </div>
@@ -1119,13 +1189,13 @@
                 </div>
               </div>
 
-              <!-- Centro: Busca Rápida -->
-              <div class="order-3 md:order-2 w-full md:w-auto md:flex-1 md:max-w-md">
-                <div class="relative">
+              <!-- Centro: Busca Rápida + Atalho "Ir para Art." -->
+              <div class="order-3 md:order-2 w-full md:w-auto md:flex-1 md:max-w-xl flex items-center gap-2">
+                <div class="relative flex-1 min-w-0">
                   <svg class="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
                   </svg>
-                  <input id="searchInput" type="text" placeholder="Buscar por artigo (ex: Art. 5º) ou texto..."
+                  <input id="searchInput" type="text" placeholder="Buscar por artigo ou palavra-chave..."
                     oninput="handleSearch(this.value)"
                     class="w-full pl-9 pr-8 py-2 rounded-xl text-xs sm:text-sm bg-slate-100/90 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition-all" />
                   <button id="clearSearchBtn" type="button" onclick="clearSearch()"
@@ -1136,6 +1206,21 @@
                     </svg>
                   </button>
                 </div>
+
+                <!-- Atalho Ir para Art. -->
+                <form onsubmit="handleJumpToArticle(event)" class="flex items-center shrink-0">
+                  <div class="relative flex items-center">
+                    <input id="jumpArticleInput" type="text" placeholder="Ir p/ Art." title="Digite o número do artigo (ex: 37 ou 29-A) e pressione Enter"
+                      class="w-24 sm:w-28 pl-2.5 pr-7 py-2 rounded-xl text-xs bg-slate-100/90 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 transition-all" />
+                    <button type="submit" title="Ir para o artigo"
+                      class="absolute right-1.5 p-1 rounded-lg text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-slate-700 transition-colors"
+                      aria-label="Ir para artigo">
+                      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6" />
+                      </svg>
+                    </button>
+                  </div>
+                </form>
               </div>
 
               <!-- Direita: A-/A+, Serif/Sans, Tema, Importar, Backup JSON, Conta e Sair -->
@@ -1308,13 +1393,24 @@
                       <p id="activeLawMeta" class="text-xs text-slate-500 dark:text-slate-400 mt-1"></p>
                     </div>
 
-                    <button type="button" onclick="openAddArticleModal()"
-                      class="self-start sm:self-auto inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-slate-900 dark:bg-indigo-600 text-white hover:bg-slate-800 dark:hover:bg-indigo-500 transition-colors shadow-sm shrink-0">
-                      <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4" />
-                      </svg>
-                      <span>Adicionar Artigo</span>
-                    </button>
+                    <div class="flex flex-wrap items-center gap-2 self-start sm:self-auto shrink-0">
+                      <button type="button" id="cleanMdTagsBtn" onclick="cleanMarkdownTagsInActiveLaw()"
+                        title="Remove tags literais (&lt;u&gt;, **, &#96;&#96;&#96;, rodapés do Planalto) preservando seus grifos e observações"
+                        class="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 hover:border-indigo-400 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors shadow-sm">
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+                        </svg>
+                        <span>Limpar tags MD</span>
+                      </button>
+
+                      <button type="button" onclick="openAddArticleModal()"
+                        class="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-slate-900 dark:bg-indigo-600 text-white hover:bg-slate-800 dark:hover:bg-indigo-500 transition-colors shadow-sm">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4" />
+                        </svg>
+                        <span>Adicionar Artigo</span>
+                      </button>
+                    </div>
                   </div>
 
                   <!-- Filtros de Estudo -->
@@ -1484,7 +1580,7 @@
                 <label class="flex items-start gap-2.5 cursor-pointer">
                   <input id="optCleanPlanalto" type="checkbox" checked onchange="updateImportPreview()" class="mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
                   <span class="text-xs text-slate-600 dark:text-slate-300">
-                    Remover artefatos do Planalto (<code class="px-1 rounded bg-slate-200 dark:bg-slate-700">[URL 🔗](...)</code>) e unir linhas quebradas no meio da frase.
+                    Remover artefatos do Planalto (<code class="px-1 rounded bg-slate-200 dark:bg-slate-700">[URL 🔗](...)</code>, cercas <code class="px-1 rounded bg-slate-200 dark:bg-slate-700">&#96;&#96;&#96;</code>, tags <code class="px-1 rounded bg-slate-200 dark:bg-slate-700">&lt;u&gt;</code>, rodapés de impressão) e unir linhas quebradas.
                   </span>
                 </label>
                 <label class="flex items-start gap-2.5 cursor-pointer">
@@ -1563,7 +1659,7 @@
     }
 
     // -----------------------------------------------------------------------
-    // 8. SINCRONIZAÇÃO EM TEMPO REAL COM FIRESTORE (WORKSPACE + LEI ATIVA)
+    // 8. SINCRONIZAÇÃO EM TEMPO REAL COM FIRESTORE (COM CHUNKING AUTOMÁTICO)
     // -----------------------------------------------------------------------
     function setSyncStatus(status, customLabel = '') {
       const badge = document.getElementById('syncStatusBadge');
@@ -1595,6 +1691,235 @@
     }
 
     /**
+     * Divide um array de artigos já serializados em blocos de no máximo maxBytes UTF-8.
+     */
+    function splitArticlesIntoChunks(serializedArticles, maxBytes = CHUNK_TARGET_BYTES) {
+      const chunks = [];
+      let currentChunk = [];
+      let currentBytes = 96; // margem para { index, articles: [], updatedAt }
+
+      for (const art of serializedArticles) {
+        const artBytes = getUtf8ByteSize(art) + 2;
+        if (currentChunk.length > 0 && (currentBytes + artBytes) > maxBytes) {
+          chunks.push(currentChunk);
+          currentChunk = [art];
+          currentBytes = 96 + artBytes;
+        } else {
+          currentChunk.push(art);
+          currentBytes += artBytes;
+        }
+      }
+      if (currentChunk.length > 0) {
+        chunks.push(currentChunk);
+      }
+      return chunks;
+    }
+
+    /**
+     * Remove todos os documentos da subcoleção `chunks` de uma lei (em lotes seguros).
+     */
+    async function deleteLawChunks(uid, lawId, minIndex = 0) {
+      const snap = await getDocs(lawChunksCollectionRef(uid, lawId));
+      const docsToDelete = [];
+      snap.forEach(d => {
+        const data = d.data();
+        const idx = typeof data.index === 'number'
+          ? data.index
+          : Number(d.id.replace('chunk_', '')) || 0;
+        if (idx >= minIndex) {
+          docsToDelete.push(d.ref);
+        }
+      });
+
+      for (let i = 0; i < docsToDelete.length; i += MAX_BATCH_OPS) {
+        const batch = writeBatch(db);
+        docsToDelete.slice(i, i + MAX_BATCH_OPS).forEach(ref => batch.delete(ref));
+        await batch.commit();
+      }
+    }
+
+    /**
+     * Grava uma lei no Cloud Firestore com:
+     * 1) Otimização de payload (sem duplicar originalHtml / campos vazios)
+     * 2) Edição rápida de chunk único quando apenas 1 artigo foi alterado em lei fragmentada
+     * 3) Chunking automático em subcoleção `chunks/chunk_{i}` quando ultrapassar 350 KB
+     */
+    async function saveLawToCloud(uid, lawObj, options = {}) {
+      const { onProgress = null, dirtyArticleId = null, skipChunkCleanup = false } = options;
+      const now = Date.now();
+      const allArticles = Array.isArray(lawObj.articles) ? lawObj.articles : [];
+
+      // Caminho rápido: edição de 1 único artigo em uma lei já fragmentada
+      if (
+        dirtyArticleId &&
+        lawObj.chunked === true &&
+        Array.isArray(lawObj._chunkArticleIds) &&
+        lawObj._chunkArticleIds.length > 0
+      ) {
+        const targetChunkIdx = lawObj._chunkArticleIds.findIndex(ids => ids.includes(dirtyArticleId));
+        if (targetChunkIdx !== -1) {
+          const idSet = new Set(lawObj._chunkArticleIds[targetChunkIdx]);
+          const chunkArticles = allArticles
+            .filter(a => idSet.has(a.id))
+            .map(serializeArticleForStorage);
+
+          const chunkPayload = {
+            index: targetChunkIdx,
+            articles: chunkArticles,
+            updatedAt: now
+          };
+
+          if (getUtf8ByteSize(chunkPayload) <= SINGLE_CHUNK_MAX_BYTES) {
+            const batch = writeBatch(db);
+            batch.set(lawChunkDocRef(uid, lawObj.id, targetChunkIdx), chunkPayload);
+            batch.set(lawDocRef(uid, lawObj.id), {
+              articleCount: allArticles.length,
+              updatedAt: now
+            }, { merge: true });
+            await batch.commit();
+            lawObj.updatedAt = now;
+            lastSavedLawSignature = `${lawObj.id}:${now}`;
+            return { chunked: true, chunkCount: lawObj._chunkArticleIds.length, fastUpdate: true };
+          }
+          // Se o chunk ultrapassou 500 KB após a edição, segue para re-fragmentação completa abaixo
+        }
+      }
+
+      const serializedArticles = allArticles.map(serializeArticleForStorage);
+      const baseMeta = {
+        id: lawObj.id,
+        subjectId: lawObj.subjectId,
+        shortName: String(lawObj.shortName || lawObj.title || 'Lei'),
+        title: String(lawObj.title || 'Lei'),
+        subtitle: String(lawObj.subtitle || ''),
+        order: Number(lawObj.order) || 1,
+        articleCount: serializedArticles.length,
+        updatedAt: now
+      };
+
+      const singleDocPayload = {
+        ...baseMeta,
+        chunked: false,
+        articles: serializedArticles
+      };
+      const totalBytes = getUtf8ByteSize(singleDocPayload);
+
+      // Lei pequena (<= 350 KB): salva diretamente no documento pai
+      if (totalBytes <= CHUNK_TARGET_BYTES) {
+        if (lawObj.chunked === true && !skipChunkCleanup) {
+          await deleteLawChunks(uid, lawObj.id, 0);
+        }
+        await setDoc(lawDocRef(uid, lawObj.id), singleDocPayload);
+        lawObj.chunked = false;
+        lawObj.chunkCount = 0;
+        lawObj._chunkArticleIds = [];
+        lawObj.updatedAt = now;
+        lastSavedLawSignature = `${lawObj.id}:${now}`;
+        return { chunked: false, chunkCount: 0, fastUpdate: false };
+      }
+
+      // Lei grande (> 350 KB): fragmenta automaticamente em subcoleção `chunks`
+      const chunks = splitArticlesIntoChunks(serializedArticles, CHUNK_TARGET_BYTES);
+      const totalChunks = chunks.length;
+
+      // Grava blocos em lotes pequenos (seguro contra limite de tamanho de requisição e permite feedback)
+      let i = 0;
+      while (i < totalChunks) {
+        const batch = writeBatch(db);
+        let opsInBatch = 0;
+        let bytesInBatch = 0;
+
+        while (i < totalChunks && opsInBatch < MAX_BATCH_OPS) {
+          const payload = {
+            index: i,
+            articles: chunks[i],
+            updatedAt: now
+          };
+          const bSize = getUtf8ByteSize(payload);
+          if (opsInBatch > 0 && bytesInBatch + bSize > 1200000) break;
+
+          if (typeof onProgress === 'function') {
+            onProgress(i + 1, totalChunks);
+          }
+          batch.set(lawChunkDocRef(uid, lawObj.id, i), payload);
+          opsInBatch++;
+          bytesInBatch += bSize;
+          i++;
+        }
+
+        await batch.commit();
+      }
+
+      // Remove blocos excedentes de versões anteriores caso o novo número de blocos seja menor
+      if (!skipChunkCleanup) {
+        await deleteLawChunks(uid, lawObj.id, totalChunks);
+      }
+
+      // Grava o documento pai somente com metadados (SEM array articles)
+      const parentMetaDoc = {
+        ...baseMeta,
+        chunked: true,
+        chunkCount: totalChunks
+      };
+      await setDoc(lawDocRef(uid, lawObj.id), parentMetaDoc);
+
+      lawObj.chunked = true;
+      lawObj.chunkCount = totalChunks;
+      lawObj._chunkArticleIds = chunks.map(c => c.map(a => a.id));
+      lawObj.updatedAt = now;
+      lastSavedLawSignature = `${lawObj.id}:${now}`;
+      return { chunked: true, chunkCount: totalChunks, fastUpdate: false };
+    }
+
+    /**
+     * Carrega uma lei completa (suporta tanto formato legado não-fragmentado quanto `chunked: true`).
+     */
+    async function loadLawArticlesFromCloud(uid, lawId, rawParentData) {
+      if (rawParentData.chunked === true) {
+        const chunksSnap = await getDocs(lawChunksCollectionRef(uid, lawId));
+        const chunkList = [];
+        chunksSnap.forEach(d => {
+          const data = d.data();
+          const idx = typeof data.index === 'number'
+            ? data.index
+            : Number(d.id.replace('chunk_', '')) || 0;
+          chunkList.push({
+            index: idx,
+            articles: Array.isArray(data.articles) ? data.articles : []
+          });
+        });
+        chunkList.sort((a, b) => a.index - b.index);
+
+        const hydrated = [];
+        const chunkArticleIds = [];
+        for (const c of chunkList) {
+          const ids = [];
+          for (const rawArt of c.articles) {
+            const art = hydrateArticleFromStorage(rawArt);
+            hydrated.push(art);
+            ids.push(art.id);
+          }
+          chunkArticleIds.push(ids);
+        }
+        return {
+          articles: hydrated,
+          chunked: true,
+          chunkCount: chunkList.length,
+          _chunkArticleIds: chunkArticleIds
+        };
+      }
+
+      // Retrocompatibilidade: lei salva em documento único
+      const rawArticles = Array.isArray(rawParentData.articles) ? rawParentData.articles : [];
+      return {
+        articles: rawArticles.map(hydrateArticleFromStorage),
+        chunked: false,
+        chunkCount: 0,
+        _chunkArticleIds: []
+      };
+    }
+
+    /**
      * Garante o seed inicial no Firestore na primeira vez que o usuário acessa.
      */
     async function seedWorkspaceIfNeeded(uid) {
@@ -1606,10 +1931,11 @@
           setSyncStatus('saving', 'Preparando caderno...');
           const starter = buildStarterSeed();
           const batch = writeBatch(db);
+          const now = Date.now();
 
           batch.set(workspaceDocRef(uid), {
             preferences: {
-              darkMode: false,
+              darkMode: true,
               fontSize: 16,
               fontFamily: 'sans',
               activeSubjectId: 'sub-adm',
@@ -1617,15 +1943,23 @@
             },
             subjects: starter.subjects,
             lawIndex: starter.lawIndex,
-            createdAt: Date.now(),
-            updatedAt: Date.now()
+            createdAt: now,
+            updatedAt: now
           });
 
           starter.laws.forEach(law => {
             batch.set(lawDocRef(uid, law.id), {
-              ...law,
-              createdAt: Date.now(),
-              updatedAt: Date.now()
+              id: law.id,
+              subjectId: law.subjectId,
+              shortName: law.shortName,
+              title: law.title,
+              subtitle: law.subtitle,
+              order: law.order,
+              chunked: false,
+              articleCount: law.articles.length,
+              articles: law.articles.map(serializeArticleForStorage),
+              createdAt: now,
+              updatedAt: now
             });
           });
 
@@ -1665,7 +1999,7 @@
             const data = snap.data();
             workspace = {
               preferences: {
-                darkMode: Boolean(data.preferences?.darkMode),
+                darkMode: data.preferences?.darkMode !== undefined ? Boolean(data.preferences.darkMode) : true,
                 fontSize: Number(data.preferences?.fontSize) || 16,
                 fontFamily: data.preferences?.fontFamily === 'serif' ? 'serif' : 'sans',
                 activeSubjectId: data.preferences?.activeSubjectId || '',
@@ -1705,7 +2039,7 @@
     }
 
     /**
-     * Assina em tempo real (`onSnapshot`) apenas o documento da lei atualmente aberta.
+     * Assina em tempo real (`onSnapshot`) a lei atualmente aberta (com suporte a chunks).
      */
     function subscribeToActiveLaw(lawId) {
       if (!currentUser) return;
@@ -1733,11 +2067,12 @@
 
       currentSubscribedLawId = lawId;
       activeLawDoc = null;
+      visibleArticlesLimit = INITIAL_VISIBLE_ARTICLES;
       renderLoadingArticles();
 
       unsubActiveLaw = onSnapshot(
         lawDocRef(currentUser.uid, lawId),
-        snap => {
+        async snap => {
           if (!currentUser || currentSubscribedLawId !== lawId) return;
 
           if (!snap.exists()) {
@@ -1746,46 +2081,55 @@
             return;
           }
 
-          // Evita sobrescrever edições locais que ainda aguardam o debounce de 600ms
           if (hasLocalUnsavedLawChanges) {
             return;
           }
 
           const raw = snap.data();
-          const sanitizedArticles = Array.isArray(raw.articles)
-            ? raw.articles.map(a => ({
-                id: a.id || generateId('art'),
-                number: String(a.number || ''),
-                sectionHeader: String(a.sectionHeader || ''),
-                originalHtml: sanitizeHtml(a.originalHtml || ''),
-                html: sanitizeHtml(a.html || ''),
-                note: String(a.note || ''),
-                modifications: Array.isArray(a.modifications) ? a.modifications : []
-              }))
-            : [];
-
-          activeLawDoc = {
-            id: snap.id,
-            subjectId: raw.subjectId || '',
-            shortName: String(raw.shortName || raw.title || 'Lei'),
-            title: String(raw.title || 'Lei sem título'),
-            subtitle: String(raw.subtitle || ''),
-            order: Number(raw.order) || 1,
-            articles: sanitizedArticles
-          };
-
-          // Proteção de cursor: se o usuário estiver digitando, não recria os inputs em foco
-          const activeEl = document.activeElement;
-          const isTypingInBody = activeEl && activeEl.classList?.contains('article-body') && activeEl.isContentEditable;
-          const isTypingInNote = activeEl && activeEl.hasAttribute?.('data-note-art-id');
-
-          if (isTypingInBody || isTypingInNote) {
-            renderHeader();
-          } else {
-            renderArticles();
+          const snapSig = `${snap.id}:${raw.updatedAt || 0}`;
+          if (activeLawDoc && activeLawDoc.id === snap.id && snapSig === lastSavedLawSignature) {
+            if (pendingWrites === 0) setSyncStatus('synced');
+            return;
           }
 
-          if (pendingWrites === 0) setSyncStatus('synced');
+          try {
+            if (raw.chunked === true && !activeLawDoc) {
+              setSyncStatus('saving', 'Carregando blocos...');
+            }
+            const loaded = await loadLawArticlesFromCloud(currentUser.uid, snap.id, raw);
+            if (!currentUser || currentSubscribedLawId !== lawId || hasLocalUnsavedLawChanges) return;
+
+            activeLawDoc = {
+              id: snap.id,
+              subjectId: raw.subjectId || '',
+              shortName: String(raw.shortName || raw.title || 'Lei'),
+              title: String(raw.title || 'Lei sem título'),
+              subtitle: String(raw.subtitle || ''),
+              order: Number(raw.order) || 1,
+              updatedAt: raw.updatedAt || 0,
+              chunked: loaded.chunked,
+              chunkCount: loaded.chunkCount,
+              _chunkArticleIds: loaded._chunkArticleIds,
+              articles: loaded.articles
+            };
+
+            const activeEl = document.activeElement;
+            const isTypingInBody = activeEl && activeEl.classList?.contains('article-body') && activeEl.isContentEditable;
+            const isTypingInNote = activeEl && activeEl.hasAttribute?.('data-note-art-id');
+
+            if (isTypingInBody || isTypingInNote) {
+              renderHeader();
+            } else {
+              renderArticles();
+            }
+
+            if (pendingWrites === 0) setSyncStatus('synced');
+          } catch (loadErr) {
+            console.error('Erro ao carregar blocos da lei:', loadErr);
+            const msg = translateFirebaseError(loadErr);
+            setSyncStatus('error', 'Offline / Erro');
+            showFirestoreBanner(msg);
+          }
         },
         err => {
           console.error('Erro no listener da lei ativa:', err);
@@ -1829,11 +2173,19 @@
     }
 
     /**
-     * Salva o documento da lei ativa no Firestore com debounce de 600ms e sanitização XSS.
+     * Salva a lei ativa no Firestore com debounce de 600ms, sanitização XSS,
+     * edição rápida de chunk único e fragmentação automática acima de 350 KB.
      */
-    function scheduleSaveActiveLaw(immediate = false) {
+    function scheduleSaveActiveLaw(immediate = false, dirtyArticleId = null) {
       if (!currentUser || !activeLawDoc) return;
       hasLocalUnsavedLawChanges = true;
+      if (dirtyArticleId) {
+        dirtyArticleIds.add(dirtyArticleId);
+      } else {
+        // Indica mudança estrutural (ex: adicionar/excluir artigo ou limpeza em massa)
+        dirtyArticleIds.add('__FULL__');
+      }
+
       setSyncStatus('saving');
       clearTimeout(lawSaveTimer);
 
@@ -1841,33 +2193,24 @@
 
       const persist = async () => {
         if (!currentUser || !targetLaw) return;
+        const singleDirtyId =
+          dirtyArticleIds.size === 1 && !dirtyArticleIds.has('__FULL__')
+            ? Array.from(dirtyArticleIds)[0]
+            : null;
+        dirtyArticleIds.clear();
+
         pendingWrites++;
         try {
-          const cleanPayload = {
-            id: targetLaw.id,
-            subjectId: targetLaw.subjectId,
-            shortName: targetLaw.shortName,
-            title: targetLaw.title,
-            subtitle: targetLaw.subtitle || '',
-            order: targetLaw.order || 1,
-            updatedAt: Date.now(),
-            articles: (targetLaw.articles || []).map(a => ({
-              id: a.id,
-              number: String(a.number || ''),
-              sectionHeader: String(a.sectionHeader || ''),
-              originalHtml: sanitizeHtml(a.originalHtml || ''),
-              html: sanitizeHtml(a.html || ''),
-              note: String(a.note || ''),
-              modifications: Array.isArray(a.modifications) ? a.modifications : []
-            }))
-          };
+          await saveLawToCloud(currentUser.uid, targetLaw, {
+            dirtyArticleId: singleDirtyId,
+            onProgress: (done, total) => {
+              setSyncStatus('saving', `Salvando (bloco ${done} de ${total})...`);
+            }
+          });
 
-          await setDoc(lawDocRef(currentUser.uid, targetLaw.id), cleanPayload);
-
-          // Atualiza contador de artigos no índice do workspace se mudou
           const idxEntry = workspace.lawIndex.find(l => l.id === targetLaw.id);
-          if (idxEntry && idxEntry.articleCount !== cleanPayload.articles.length) {
-            idxEntry.articleCount = cleanPayload.articles.length;
+          if (idxEntry && idxEntry.articleCount !== (targetLaw.articles || []).length) {
+            idxEntry.articleCount = (targetLaw.articles || []).length;
             scheduleSaveWorkspace(true);
           }
 
@@ -1900,6 +2243,7 @@
       }
       clearTimeout(lawSaveTimer);
       clearTimeout(workspaceSaveTimer);
+      clearTimeout(searchDebounceTimer);
 
       currentUser = null;
       currentSubscribedLawId = null;
@@ -1908,18 +2252,23 @@
       searchQuery = '';
       filterAnnotatedOnly = false;
       filterModsOnly = false;
+      visibleArticlesLimit = INITIAL_VISIBLE_ARTICLES;
       pendingWrites = 0;
       hasLocalUnsavedLawChanges = false;
+      dirtyArticleIds.clear();
+      lastSavedLawSignature = '';
       firestorePermissionError = '';
       pendingConfirmCallback = null;
       renameTargetSubjectId = null;
+      lastJumpKey = '';
+      lastJumpMatchCursor = -1;
       openNotes.clear();
       openMods.clear();
       openModForms.clear();
 
       workspace = {
         preferences: {
-          darkMode: false,
+          darkMode: true,
           fontSize: 16,
           fontFamily: 'sans',
           activeSubjectId: '',
@@ -2148,8 +2497,14 @@
       searchQuery = '';
       filterAnnotatedOnly = false;
       filterModsOnly = false;
+      visibleArticlesLimit = INITIAL_VISIBLE_ARTICLES;
+      dirtyArticleIds.clear();
+      lastJumpKey = '';
+      lastJumpMatchCursor = -1;
       const searchInput = document.getElementById('searchInput');
       if (searchInput) searchInput.value = '';
+      const jumpInput = document.getElementById('jumpArticleInput');
+      if (jumpInput) jumpInput.value = '';
       document.getElementById('clearSearchBtn')?.classList.add('hidden');
 
       scheduleSaveWorkspace();
@@ -2161,13 +2516,20 @@
     }
 
     function handleSearch(val) {
-      searchQuery = val.trim();
-      document.getElementById('clearSearchBtn')?.classList.toggle('hidden', searchQuery.length === 0);
-      renderArticles();
+      const trimmed = val.trim();
+      document.getElementById('clearSearchBtn')?.classList.toggle('hidden', trimmed.length === 0);
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = setTimeout(() => {
+        searchQuery = trimmed;
+        visibleArticlesLimit = INITIAL_VISIBLE_ARTICLES;
+        renderArticles();
+      }, 200);
     }
 
     function clearSearch() {
+      clearTimeout(searchDebounceTimer);
       searchQuery = '';
+      visibleArticlesLimit = INITIAL_VISIBLE_ARTICLES;
       const input = document.getElementById('searchInput');
       if (input) {
         input.value = '';
@@ -2177,14 +2539,108 @@
       renderArticles();
     }
 
+    function normalizeArticleJumpKey(str) {
+      return String(str || '')
+        .toLowerCase()
+        .replace(/^art\.?\s*/i, '')
+        .replace(/[º°.\s]/g, '')
+        .trim();
+    }
+
+    /**
+     * Atalho "Ir para Art.": encontra o artigo exato (ex: 37, 5º, 29-A),
+     * expande a paginação se necessário, rola suavemente e destaca a borda.
+     */
+    function handleJumpToArticle(event) {
+      event.preventDefault();
+      if (!activeLawDoc || !activeLawDoc.articles?.length) return;
+      const input = document.getElementById('jumpArticleInput');
+      const rawVal = input?.value.trim() || '';
+      if (!rawVal) return;
+
+      const targetKey = normalizeArticleJumpKey(rawVal);
+      if (!targetKey) return;
+      const targetNoHyphen = targetKey.replace(/-/g, '');
+
+      const matchesArticle = art => {
+        const k = normalizeArticleJumpKey(art.number);
+        return k === targetKey || k.replace(/-/g, '') === targetNoHyphen;
+      };
+
+      // Tenta primeiro na lista filtrada; se estiver filtrado fora, limpa os filtros
+      let list = getFilteredArticles();
+      let matchingIndices = [];
+      list.forEach((a, idx) => {
+        if (matchesArticle(a)) matchingIndices.push(idx);
+      });
+
+      if (matchingIndices.length === 0 && (searchQuery || filterAnnotatedOnly || filterModsOnly)) {
+        filterAnnotatedOnly = false;
+        filterModsOnly = false;
+        searchQuery = '';
+        const sInput = document.getElementById('searchInput');
+        if (sInput) sInput.value = '';
+        document.getElementById('clearSearchBtn')?.classList.add('hidden');
+        updateFilterButtons();
+        list = getFilteredArticles();
+        list.forEach((a, idx) => {
+          if (matchesArticle(a)) matchingIndices.push(idx);
+        });
+      }
+
+      if (matchingIndices.length === 0) {
+        showToast(`Artigo "${rawVal}" não encontrado nesta lei.`, 'error');
+        return;
+      }
+
+      // Permite alternar entre ocorrências (ex: Art. 1º da CF e Art. 1º do ADCT) ao apertar Enter novamente
+      if (lastJumpKey === targetKey) {
+        lastJumpMatchCursor = (lastJumpMatchCursor + 1) % matchingIndices.length;
+      } else {
+        lastJumpKey = targetKey;
+        lastJumpMatchCursor = 0;
+      }
+
+      const matchIdx = matchingIndices[lastJumpMatchCursor];
+      const targetArt = list[matchIdx];
+
+      if (matchIdx >= visibleArticlesLimit) {
+        visibleArticlesLimit = matchIdx + 10;
+      }
+      renderArticles();
+
+      requestAnimationFrame(() => {
+        const card = document.getElementById(`card-${targetArt.id}`);
+        if (card) {
+          card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          card.classList.remove('article-jump-highlight');
+          void card.offsetWidth;
+          card.classList.add('article-jump-highlight');
+          setTimeout(() => card.classList.remove('article-jump-highlight'), 2400);
+        }
+      });
+    }
+
+    function loadMoreArticles(step = LOAD_MORE_STEP) {
+      visibleArticlesLimit += step;
+      renderArticles();
+    }
+
+    function showAllArticles() {
+      visibleArticlesLimit = (activeLawDoc?.articles?.length || 10000) + 100;
+      renderArticles();
+    }
+
     function toggleAnnotatedFilter() {
       filterAnnotatedOnly = !filterAnnotatedOnly;
+      visibleArticlesLimit = INITIAL_VISIBLE_ARTICLES;
       updateFilterButtons();
       renderArticles();
     }
 
     function toggleModsFilter() {
       filterModsOnly = !filterModsOnly;
+      visibleArticlesLimit = INITIAL_VISIBLE_ARTICLES;
       updateFilterButtons();
       renderArticles();
     }
@@ -2305,7 +2761,10 @@
       const fontSizeStyle = `font-size: ${workspace.preferences.fontSize || 16}px;`;
       const serifClass = workspace.preferences.fontFamily === 'serif' ? 'font-reading-serif' : '';
 
-      container.innerHTML = filtered.map(art => {
+      const visibleSlice = filtered.slice(0, visibleArticlesLimit);
+      const remainingCount = filtered.length - visibleSlice.length;
+
+      const cardsHtml = visibleSlice.map(art => {
         const isEditing = editingArticleId === art.id;
         const isNoteOpen = openNotes.has(art.id);
         const isModOpen = openMods.has(art.id);
@@ -2581,11 +3040,29 @@
           </article>
         `;
       }).join('');
+
+      const paginationFooter = remainingCount > 0
+        ? `
+          <div class="pt-4 flex flex-col sm:flex-row items-center justify-center gap-2.5">
+            <button type="button" onclick="loadMoreArticles(${LOAD_MORE_STEP})"
+              class="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl text-xs sm:text-sm font-semibold bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm transition-colors">
+              <span>Carregar mais ${Math.min(LOAD_MORE_STEP, remainingCount)} artigos (exibindo ${visibleSlice.length} de ${filtered.length})</span>
+            </button>
+            <button type="button" onclick="showAllArticles()"
+              class="w-full sm:w-auto inline-flex items-center justify-center px-4 py-3 rounded-xl text-xs sm:text-sm font-semibold bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 hover:border-indigo-400 transition-colors">
+              Mostrar todos (${filtered.length})
+            </button>
+          </div>
+        `
+        : '';
+
+      container.innerHTML = cardsHtml + paginationFooter;
     }
 
     function resetAllFilters() {
       filterAnnotatedOnly = false;
       filterModsOnly = false;
+      visibleArticlesLimit = INITIAL_VISIBLE_ARTICLES;
       clearSearch();
       updateFilterButtons();
       renderArticles();
@@ -2621,7 +3098,7 @@
       const bodyEl = document.getElementById(`body-${articleId}`);
       if (!art || !bodyEl) return;
       art.html = sanitizeHtml(bodyEl.innerHTML);
-      scheduleSaveActiveLaw(false);
+      scheduleSaveActiveLaw(false, articleId);
     }
 
     function finishEditing(articleId, shouldRender = true) {
@@ -2629,7 +3106,7 @@
       const bodyEl = document.getElementById(`body-${articleId}`);
       if (art && bodyEl) {
         art.html = sanitizeHtml(bodyEl.innerHTML);
-        scheduleSaveActiveLaw(true);
+        scheduleSaveActiveLaw(true, articleId);
       }
       editingArticleId = null;
       if (shouldRender) {
@@ -2680,7 +3157,7 @@
         `Todas as marcações e edições feitas em "${art.number}" voltarão ao texto original.`,
         () => {
           art.html = sanitizeHtml(art.originalHtml);
-          scheduleSaveActiveLaw(true);
+          scheduleSaveActiveLaw(true, articleId);
           renderArticles();
           showToast(`${art.number} restaurado ao original.`, 'info');
         },
@@ -2700,7 +3177,7 @@
       art.note = value;
       const dot = document.getElementById(`note-dot-${articleId}`);
       if (dot) dot.classList.toggle('hidden', value.trim().length === 0);
-      scheduleSaveActiveLaw(false);
+      scheduleSaveActiveLaw(false, articleId);
       renderHeader(getFilteredArticles().length);
     }
 
@@ -2730,7 +3207,7 @@
       if (!Array.isArray(art.modifications)) art.modifications = [];
       art.modifications.push({ id: generateId('mod'), device, type, norm, text });
       openModForms.delete(articleId);
-      scheduleSaveActiveLaw(true);
+      scheduleSaveActiveLaw(true, articleId);
       renderArticles();
       showToast('Modificação registrada na nuvem!');
     }
@@ -2739,7 +3216,7 @@
       const art = getArticleById(articleId);
       if (!art) return;
       art.modifications = (art.modifications || []).filter(m => m.id !== modId);
-      scheduleSaveActiveLaw(true);
+      scheduleSaveActiveLaw(true, articleId);
       renderArticles();
       showToast('Registro removido.', 'info');
     }
@@ -2805,8 +3282,13 @@
         `A matéria "${sub.name}" e ${relatedLaws.length} lei(s) vinculadas serão removidas permanentemente da nuvem.`,
         async () => {
           if (!currentUser) return;
-          setSyncStatus('saving');
+          setSyncStatus('saving', 'Excluindo...');
           try {
+            // Remove primeiro subcoleções de chunks de cada lei vinculada
+            for (const l of relatedLaws) {
+              await deleteLawChunks(currentUser.uid, l.id, 0);
+            }
+
             const batch = writeBatch(db);
             relatedLaws.forEach(l => batch.delete(lawDocRef(currentUser.uid, l.id)));
 
@@ -2848,8 +3330,11 @@
         `A lei "${meta.title}" e todas as suas anotações e grifos serão excluídas permanentemente.`,
         async () => {
           if (!currentUser) return;
-          setSyncStatus('saving');
+          setSyncStatus('saving', 'Excluindo lei...');
           try {
+            // Remove primeiro todos os blocos (chunks) se a lei for fragmentada
+            await deleteLawChunks(currentUser.uid, lawId, 0);
+
             const batch = writeBatch(db);
             batch.delete(lawDocRef(currentUser.uid, lawId));
 
@@ -2975,54 +3460,128 @@
       reader.readAsText(file, 'UTF-8');
     }
 
+    /**
+     * Limpeza rigorosa de marcação inline (HTML de ruído + Markdown cru) em texto bruto:
+     * - Remove tags <u>, <a>, <span>, <font>, <div>, <p> mantendo o texto interno
+     * - Converte <b> -> <strong>, <i> -> <em>, <s> -> <del>
+     * - Converte **texto**, __texto__, ~~texto~~, `texto`, *texto*
+     * - Elimina quaisquer resíduos literais de **, __, ` ou entidades &lt;u&gt;, &lt;b&gt;, &lt;i&gt;
+     */
+    function cleanRawInlineToHtml(rawLine) {
+      let s = String(rawLine || '');
+      s = s.replace(/[\uE000-\uF8FF]/g, '');
+      s = s.replace(/`{3}[a-zA-Z0-9_-]*/g, '');
+      s = s.replace(/\[URL\s*🔗?\]\([^)]*\)/gi, '');
+      s = s.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+      s = s.replace(/\\([$*_[\]])/g, '$1');
+
+      // Remove tags HTML de ruído (cruas ou já escapadas) preservando o texto interno
+      s = s.replace(/&lt;\/?(?:u|a|span|font|div|p)\b[^&]*?&gt;/gi, '');
+      s = s.replace(/<\/?(?:u|a|span|font|div|p)\b[^>]*>/gi, '');
+
+      // Normaliza <b>, <i>, <s> (cruas ou escapadas) antes do escapeHtml
+      s = s.replace(/&lt;(\/?)(?:b|strong)\b[^&]*?&gt;/gi, '<$1strong>');
+      s = s.replace(/&lt;(\/?)(?:i|em)\b[^&]*?&gt;/gi, '<$1em>');
+      s = s.replace(/&lt;(\/?)(?:s|strike|del)\b[^&]*?&gt;/gi, '<$1del>');
+      s = s.replace(/<(\/?)(?:b|strong)\b[^>]*>/gi, (_, sl) => (sl ? '@@/STRONG@@' : '@@STRONG@@'));
+      s = s.replace(/<(\/?)(?:i|em)\b[^>]*>/gi, (_, sl) => (sl ? '@@/EM@@' : '@@EM@@'));
+      s = s.replace(/<(\/?)(?:s|strike|del)\b[^>]*>/gi, (_, sl) => (sl ? '@@/DEL@@' : '@@DEL@@'));
+
+      // Escapa qualquer outro HTML potencialmente perigoso
+      s = escapeHtml(s);
+
+      // Restaura marcadores seguros
+      s = s.replace(/@@STRONG@@/g, '<strong>').replace(/@@\/STRONG@@/g, '</strong>');
+      s = s.replace(/@@EM@@/g, '<em>').replace(/@@\/EM@@/g, '</em>');
+      s = s.replace(/@@DEL@@/g, '<del>').replace(/@@\/DEL@@/g, '</del>');
+
+      // Converte Markdown inline
+      s = s.replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>');
+      s = s.replace(/__([^_\n]+?)__/g, '<strong>$1</strong>');
+      s = s.replace(/~~([^~\n]+?)~~/g, '<del>$1</del>');
+      s = s.replace(/`([^`\n]+?)`/g, '$1');
+      s = s.replace(/(^|[\s([{"'“])\*([^*\s][^*\n]*?[^*\s]|[^*\s])\*(?=[\s.,;:!?)\]}"'”]|$)/g, '$1<em>$2</em>');
+
+      // Limpa quaisquer resíduos órfãos para que NUNCA apareçam literais na tela
+      s = s.replace(/\*\*|__|`/g, '');
+      s = s.replace(/&lt;\/?(?:u|b|i|s|strong|em|del|a|span|font|div|p)\b[^&]*?&gt;/gi, '');
+      return s.replace(/\s{2,}/g, ' ').trim();
+    }
+
     function formatPlainArticleToHtml(text, fallbackNumber = '') {
       const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
       if (lines.length === 0) return `<p><strong>${escapeHtml(fallbackNumber)}</strong></p>`;
 
       return lines.map((line, idx) => {
-        const safe = escapeHtml(line).replace(
-          /(\((?:Redação dada|Incluído|Revogado|Vide|Vigência|VETADO|Promulgação)[^)]*\))/gi,
+        const cleaned = cleanRawInlineToHtml(line).replace(
+          /(\((?:Redação dada|Incluíd[oa]|Revogad[oa]|Renumerad[oa]|Numerad[oa]|Vide|Vigência|Produção de efeito|Regulamento|VETADO|Promulgação)[^)]*\))/gi,
           '<span class="text-xs text-slate-500 dark:text-slate-400">$1</span>'
         );
 
+        const plainForTest = line.replace(/[*_`~]/g, '').replace(/<\/?[^>]+>/g, '').trim();
+
         if (idx === 0) {
-          return `<p>${safe.replace(/^(Art\.?\s*\d+(?:\s*-\s*[A-Z])?[º°o.]?)/, '<strong>$1</strong>')}</p>`;
+          return `<p>${cleaned.replace(
+            /^(?:<strong>)?(Art\.?\s*\d+(?:\s*-\s*[A-Z](?=[\s.,;:º°]|$))?(?:\s*[º°]\.?|\s+o(?=\s)|\.?))(?:<\/strong>)?/,
+            '<strong>$1</strong>'
+          )}</p>`;
         }
-        if (/^(§\s*\d+[º°o]?\.?|Parágrafo único\.?)/i.test(line)) {
-          return `<p class="law-paragrafo">${safe.replace(/^(§\s*\d+[º°o]?\.?|Parágrafo único\.?)/i, '<strong>$1</strong>')}</p>`;
+        if (/^(§\s*\d+(?:\s*-\s*[A-Z])?(?:\.?\s*[º°]\.?|\s+o(?=\s)|\.?)|Parágrafo único\.?)/i.test(plainForTest)) {
+          return `<p class="law-paragrafo">${cleaned.replace(
+            /^(?:<strong>)?(§\s*\d+(?:\s*-\s*[A-Z])?(?:\.?\s*[º°]\.?|\s+o(?=\s)|\.?)|Parágrafo único\.?)(?:<\/strong>)?/i,
+            '<strong>$1</strong>'
+          )}</p>`;
         }
-        if (/^[a-z]\)\s+/.test(line)) {
-          return `<p class="law-alinea">${safe}</p>`;
+        if (/^[a-z]\s*\)\s+/.test(plainForTest)) {
+          return `<p class="law-alinea">${cleaned}</p>`;
         }
-        if (/^[IVXLCDM]+(?:-[A-Z])?\s*[-–—]\s+/.test(line)) {
-          return `<p class="law-inciso">${safe}</p>`;
+        if (/^[IVXLCDM]+(?:-[A-Z])?\s*[-–—]+\s+/.test(plainForTest)) {
+          return `<p class="law-inciso">${cleaned}</p>`;
         }
-        return `<p>${safe}</p>`;
+        return `<p>${cleaned}</p>`;
       }).join('');
     }
 
     /**
-     * Limpa artefatos do Planalto, une quebras de linha artificiais,
-     * separa cartões exclusivamente em "Art. X" maiúsculo no início da linha
-     * (evitando falsas quebras em remissões "art. 4º" no meio de frases)
-     * e move redações anteriores / tachadas para o histórico de Modificações.
+     * Parser inteligente de Markdown/Texto do Planalto (inclui arquivos convertidos de PDF como CF/88):
+     * - Remove cercas ``` preservando o texto jurídico interno
+     * - Remove cabeçalhos de data/hora e rodapés de URL + paginação (ex: 1/197)
+     * - Remove glifos Unicode de Área de Uso Privado (ex: )
+     * - Limpa links, tags HTML de ruído e Markdown cru
+     * - Une linhas quebradas no meio de frase preservando dispositivos estruturais
+     * - Diferencia "Art." (início de artigo) de "art." (citação no meio do texto)
+     * - Consolida redações anteriores consecutivas para a aba Modificações
      */
     function parseLawText(rawText, options = { cleanPlanalto: true, extractMods: true }) {
-      let text = (rawText || '').replace(/\r\n/g, '\n');
+      let text = (rawText || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+      // Remove glifos de ícones Unicode PUA (ex: ) e cercas de bloco de código Markdown (```)
+      text = text.replace(/[\uE000-\uF8FF]/g, '');
+      text = text.replace(/^\s*`{3}[^\n]*$/gm, '');
 
       if (options.cleanPlanalto) {
+        // Remove cabeçalhos de impressão (ex: "26/11/2026, 11:48 Constituição")
+        text = text.replace(/^\s*\d{1,2}\/\d{1,2}\/\d{2,4},?\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?\s+.*$/gim, '');
+        // Remove rodapés de URL + paginação (ex: "https://www.planalto.gov.br/... 1/197")
+        text = text.replace(/^\s*(?:https?:\/\/|www\.planalto\.gov\.br)\S+(?:\s+\d+\s*\/\s*\d+)?\s*$/gim, '');
+        // Remove links do Planalto e preserva texto de links Markdown
         text = text.replace(/\[URL\s*🔗?\]\([^)]*\)/gi, '');
         text = text.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
-        text = text.replace(/\\\$/g, '$');
-        text = text.replace(/^\s*[-*]\s+(?=(?:Art\.|§|Parágrafo|[IVXLCDM]+(?:-[A-Z])?\s*[-–]|[a-z]\)))/gm, '');
-        text = text.replace(/^\s*(?:Texto compilado|Mensagem de veto|Vigência)\s*$/gim, '');
+        // Desescapa caracteres Markdown
+        text = text.replace(/\\([$*_[\]])/g, '$1');
+        // Remove tags HTML de ruído (<u>, <a>, <span>, etc.) mantendo texto interno
+        text = text.replace(/&lt;\/?(?:u|a|span|font|div|p)\b[^&]*?&gt;/gi, '');
+        text = text.replace(/<\/?(?:u|a|span|font|div|p)\b[^>]*>/gi, '');
+        // Remove marcadores de lista antes de dispositivos legais
+        text = text.replace(/^\s*[-*]\s+(?=(?:Art\.|§|Parágrafo|[IVXLCDM]+(?:-[A-Z])?\s*[-–—]|[a-z]\s*\)))/gm, '');
+        // Remove linhas isoladas de metadados de topo do Planalto
+        text = text.replace(/^\s*(?:Texto compilado|Mensagem de veto|Vigência|ÍNDICE TEMÁTICO)\s*$/gim, '');
       }
 
       const rawLines = text.split('\n');
       const logicalLines = [];
-      // Case-sensitive em "Art." para não quebrar em "art. 4º desta Lei"
       const structuralStartRegex =
-        /^(?:(?:#{1,6}\s*)|(?:TÍTULO|CAPÍTULO|SEÇÃO|SUBSEÇÃO|LIVRO|PARTE)\s+|Art\.\s*\d+|§\s*\d+|Parágrafo único|[IVXLCDM]+(?:-[A-Z])?\s*[-–—]\s|[a-z]\)\s+|~~)/;
+        /^(?:(?:#{1,6}\s*)|(?:TÍTULO|CAPÍTULO|SEÇÃO|SUBSEÇÃO|LIVRO|PARTE)\s+[IVXLCDM0-9]+|ATO DAS DISPOSIÇÕES|PREÂMBULO|Art\.?\s*\d+|§\s*\d+|Parágrafo único|[IVXLCDM]+(?:-[A-Z])?\s*[-–—]+\s|[a-z]\s*\)\s+|~~)/;
 
       for (let i = 0; i < rawLines.length; i++) {
         const line = rawLines[i].trim();
@@ -3030,18 +3589,34 @@
 
         const isHeading = /^#{1,6}\s+/.test(line);
         const cleanLine = line.replace(/^#{1,6}\s+/, '').trim();
-        const isSectionTitle =
-          isHeading ||
-          /^(?:TÍTULO|CAPÍTULO|SEÇÃO|SUBSEÇÃO|LIVRO)\s+[IVXLCDM0-9]+/i.test(cleanLine);
+        if (!cleanLine) continue;
 
-        if (isSectionTitle) {
+        const prevIsSection =
+          logicalLines.length > 0 && logicalLines[logicalLines.length - 1].startsWith('__SECTION__');
+
+        const isExplicitSection =
+          isHeading ||
+          /^(?:TÍTULO|CAPÍTULO|SEÇÃO|SUBSEÇÃO|LIVRO|PARTE)\s+[IVXLCDM0-9]+(?:-[A-Z])?\b/i.test(cleanLine) ||
+          /^ATO DAS DISPOSIÇÕES CONSTITUCIONAIS TRANSITÓRIAS\b/i.test(cleanLine);
+
+        // Subtítulo em caixa alta logo após TÍTULO / CAPÍTULO / SEÇÃO (ex: "DOS PRINCÍPIOS FUNDAMENTAIS")
+        const isSectionSubtitle =
+          prevIsSection &&
+          cleanLine.length <= 130 &&
+          !structuralStartRegex.test(cleanLine) &&
+          !/^[a-z]/.test(cleanLine) &&
+          cleanLine === cleanLine.toUpperCase() &&
+          /[A-ZÀ-Ú]{3,}/.test(cleanLine) &&
+          !/\.$/.test(cleanLine);
+
+        if (isExplicitSection || isSectionSubtitle) {
           logicalLines.push(`__SECTION__${cleanLine}`);
           continue;
         }
 
         if (options.cleanPlanalto && !/^["“]/.test(cleanLine)) {
           const splitInline = cleanLine
-            .replace(/([;.:])\s+(?=(?:[IVXLCDM]+(?:-[A-Z])?\s*[-–—]\s|§\s*\d+[º°o]?|Parágrafo único\.?))/g, '$1\n')
+            .replace(/([;.:])\s+(?=(?:[IVXLCDM]+(?:-[A-Z])?\s*[-–—]+\s|§\s*\d+(?:\s*-\s*[A-Z])?(?:\.?\s*[º°]|\s+o\b)|Parágrafo único\.?))/g, '$1\n')
             .split('\n')
             .map(s => s.trim())
             .filter(Boolean);
@@ -3066,25 +3641,31 @@
       const rawArticles = [];
       let pendingSection = '';
       let currentArticle = null;
-      // Exige "Art." maiúsculo no início da linha (ex.: "Art. 1º", "Art. 55-A.", "Art.55-G.")
-      const articleStartRegex = /^(Art\.\s*\d+(?:\s*-\s*[A-Z])?[º°o.]?)\b/;
+      // Exige "Art." maiúsculo no início da linha (aceita "Art. 1º", "Art. 6 o", "Art. 29-A.", "Art.246.")
+      const articleStartRegex = /^(Art\.?\s*(\d+(?:\s*-\s*[A-Z](?=[\s.,;:º°]|$))?)(?:\s*[º°]\.?|\s+o(?=\s)|\.?))(?=\s|$|[-–—])/;
 
       for (const line of logicalLines) {
         if (line.startsWith('__SECTION__')) {
-          const secText = line.replace('__SECTION__', '').trim();
-          if (!/^(?:Presidência da República|Subchefia|LEI Nº)/i.test(secText)) {
+          const secText = line.replace('__SECTION__', '').replace(/\*\*|__|`/g, '').trim();
+          if (!/^(?:Presidência da República|Casa Civil|Subchefia|LEI Nº)/i.test(secText)) {
             pendingSection = pendingSection ? `${pendingSection} • ${secText}` : secText;
           }
           continue;
         }
 
-        const artMatch = !/^["“]/.test(line) ? line.match(articleStartRegex) : null;
+        const plainLine = line.replace(/^\*\*|\*\*$/g, '').trim();
+        const artMatch = !/^["“]/.test(plainLine) ? plainLine.match(articleStartRegex) : null;
         if (artMatch) {
           if (currentArticle) rawArticles.push(currentArticle);
-          const normalizedNum = artMatch[1].replace(/\s+/g, ' ').replace(/^Art\.(\d)/, 'Art. $1').trim();
+          const normalizedNum = artMatch[1]
+            .replace(/\s+/g, ' ')
+            .replace(/^Art\.(\d)/, 'Art. $1')
+            .replace(/\s+o$/, 'º')
+            .trim();
+          const baseKey = `art-${artMatch[2].toLowerCase().replace(/\s+/g, '')}`;
           currentArticle = {
             number: normalizedNum,
-            key: normalizedNum.toLowerCase().replace(/[^a-z0-9-]/g, ''),
+            key: baseKey,
             sectionHeader: pendingSection,
             lines: [line]
           };
@@ -3111,20 +3692,21 @@
         };
       }
 
-      // Consolida artigos repetidos consecutivos (redações anteriores -> Modificações)
+      // Consolida artigos repetidos CONSECUTIVOS (mantém a redação mais recente no cartão e move anteriores para Modificações)
+      // Como só consolida consecutivos, Art. 1º do ADCT fica preservado separado do Art. 1º da CF/88.
       const consolidated = [];
       let totalModsExtracted = 0;
 
       for (const item of rawArticles) {
         const last = consolidated[consolidated.length - 1];
         if (options.extractMods && last && last.key === item.key) {
-          const oldText = last.lines.join('\n');
-          const normMatch = oldText.match(/\(([^)]*(?:Medida Provisória|Lei nº|Redação dada|Revogado)[^)]*)\)/i);
+          const oldText = last.lines.join('\n').replace(/\*\*|__|`/g, '');
+          const normMatch = oldText.match(/\(([^)]*(?:Emenda Constitucional|Medida Provisória|Lei nº|Redação dada|Revogad[oa])[^)]*)\)/i);
           const inheritedMods = last.modifications || [];
           inheritedMods.push({
             id: generateId('mod'),
-            device: 'Caput / Redação anterior',
-            type: /Revogado/i.test(oldText) ? 'Revogado' : 'Redação Anterior',
+            device: 'Redação anterior do artigo',
+            type: /Revogad[oa]/i.test(oldText) ? 'Revogado' : 'Redação Anterior',
             norm: normMatch ? normMatch[1] : 'Redação anterior (extraída)',
             text: oldText
           });
@@ -3146,8 +3728,10 @@
           const prefixIndices = new Map();
           const linesWithMeta = item.lines.map(l => {
             const isStruck = /^~~[\s\S]*~~$/.test(l.trim());
-            const prefixMatch = l.match(/^(§\s*\d+[º°o]?|Parágrafo único|[IVXLCDM]+(?:-[A-Z])?\s*[-–—]|[a-z]\))/);
-            const prefixKey = prefixMatch ? prefixMatch[1].toLowerCase().replace(/\s+/g, '') : null;
+            const prefixMatch = l.match(/^(§\s*\d+(?:\s*-\s*[A-Z])?(?:\.?\s*[º°]|\s+o\b)?|Parágrafo único|[IVXLCDM]+(?:-[A-Z])?\s*[-–—]+|[a-z]\s*\))/);
+            const prefixKey = prefixMatch
+              ? prefixMatch[1].toLowerCase().replace(/[º°.\s–—-]+/g, '')
+              : null;
             return { text: l, isStruck, prefixKey };
           });
 
@@ -3155,10 +3739,10 @@
             if (!meta.isStruck && meta.prefixKey) {
               const prevIdx = prefixIndices.get(meta.prefixKey);
               if (prevIdx !== undefined) {
-                const isNearby = idx - prevIdx <= 4;
+                const isNearby = idx - prevIdx <= 6;
                 const hasLegNote =
-                  /\((?:Redação dada|Incluído|Revogado|Medida Provisória|Lei nº)/i.test(meta.text) ||
-                  /\((?:Redação dada|Incluído|Revogado|Medida Provisória|Lei nº)/i.test(linesWithMeta[prevIdx].text);
+                  /\((?:Redação dada|Incluíd[oa]|Revogad[oa]|Emenda Constitucional|Medida Provisória|Lei nº)/i.test(meta.text) ||
+                  /\((?:Redação dada|Incluíd[oa]|Revogad[oa]|Emenda Constitucional|Medida Provisória|Lei nº)/i.test(linesWithMeta[prevIdx].text);
                 if (isNearby || hasLegNote) {
                   linesWithMeta[prevIdx].superseded = true;
                 }
@@ -3169,24 +3753,25 @@
 
           for (const meta of linesWithMeta) {
             if (meta.isStruck) {
-              const cleanStruck = meta.text.replace(/^~~|~~$/g, '').trim();
-              const normMatch = cleanStruck.match(/\(([^)]*(?:Lei|MP|Medida Provisória|Revogado|Redação)[^)]*)\)/i);
+              const cleanStruck = meta.text.replace(/^~~|~~$/g, '').replace(/\*\*|__|`/g, '').trim();
+              const normMatch = cleanStruck.match(/\(([^)]*(?:Emenda|Lei|MP|Medida Provisória|Revogad[oa]|Redação)[^)]*)\)/i);
               mods.push({
                 id: generateId('mod'),
                 device: meta.prefixKey ? meta.prefixKey.toUpperCase() : 'Trecho tachado',
-                type: /Revogado/i.test(cleanStruck) ? 'Revogado' : 'Redação Anterior',
+                type: /Revogad[oa]/i.test(cleanStruck) ? 'Revogado' : 'Redação Anterior',
                 norm: normMatch ? normMatch[1] : 'Texto tachado no original',
                 text: cleanStruck
               });
               totalModsExtracted++;
             } else if (meta.superseded) {
-              const normMatch = meta.text.match(/\(([^)]*(?:Lei|MP|Medida Provisória|Revogado|Redação)[^)]*)\)/i);
+              const cleanPrev = meta.text.replace(/\*\*|__|`/g, '').trim();
+              const normMatch = cleanPrev.match(/\(([^)]*(?:Emenda|Lei|MP|Medida Provisória|Revogad[oa]|Redação)[^)]*)\)/i);
               mods.push({
                 id: generateId('mod'),
                 device: meta.prefixKey ? meta.prefixKey.toUpperCase() : 'Dispositivo',
-                type: /Revogado/i.test(meta.text) ? 'Revogado' : 'Redação Anterior',
+                type: /Revogad[oa]/i.test(cleanPrev) ? 'Revogado' : 'Redação Anterior',
                 norm: normMatch ? normMatch[1] : 'Redação anterior',
-                text: meta.text
+                text: cleanPrev
               });
               totalModsExtracted++;
             } else {
@@ -3194,7 +3779,7 @@
               const inlineStruck = cleanedLine.match(/~~([^~]+)~~/g);
               if (inlineStruck) {
                 inlineStruck.forEach(chunk => {
-                  const inner = chunk.replace(/^~~|~~$/g, '').trim();
+                  const inner = chunk.replace(/^~~|~~$/g, '').replace(/\*\*|__|`/g, '').trim();
                   mods.push({
                     id: generateId('mod'),
                     device: 'Trecho tachado',
@@ -3228,6 +3813,171 @@
       return { articles: finalArticles, totalModsExtracted };
     }
 
+    /**
+     * Limpa artefatos literais de Markdown/HTML já salvos no Firestore
+     * preservando intactos os marca-textos (<mark> / <span style="...">), cores e observações do usuário.
+     */
+    function isPrintNoiseText(str) {
+      const t = String(str || '').trim();
+      if (!t) return true;
+      if (/^`{3}[a-zA-Z0-9_-]*$/.test(t)) return true;
+      if (/^\d{1,2}\/\d{1,2}\/\d{2,4},?\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?\s+/.test(t)) return true;
+      if (/^(?:https?:\/\/|www\.planalto\.gov\.br)\S+(?:\s+\d+\s*\/\s*\d+)?$/i.test(t)) return true;
+      return false;
+    }
+
+    function cleanTextNodeToFragment(rawText) {
+      let s = String(rawText || '');
+      s = s.replace(/[\uE000-\uF8FF]/g, '');
+      s = s.replace(/`{3}[a-zA-Z0-9_-]*/g, '');
+      s = s.replace(/\b\d{1,2}\/\d{1,2}\/\d{2,4},?\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?\s+[^\n]*?(?=\s+https?:|$)/gi, '');
+      s = s.replace(/https?:\/\/www\.planalto\.gov\.br\/\S+(?:\s+\d+\s*\/\s*\d+)?/gi, '');
+      s = s.replace(/\[URL\s*🔗?\]\([^)]*\)/gi, '');
+      s = s.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+      s = s.replace(/\\([$*_[\]])/g, '$1');
+
+      // Remove tags HTML literais de ruído que ficaram como texto (ex: <u>, </u>, <a>, <span>)
+      s = s.replace(/<\/?(?:u|a|span|font|div|p)\b[^>]*>/gi, '');
+      // Converte <b>, <i>, <s> literais em marcação para virar elementos DOM reais
+      s = s.replace(/<(?:b|strong)\b[^>]*>([\s\S]*?)<\/(?:b|strong)>/gi, '**$1**');
+      s = s.replace(/<(?:i|em)\b[^>]*>([\s\S]*?)<\/(?:i|em)>/gi, '*$1*');
+      s = s.replace(/<(?:s|strike|del)\b[^>]*>([\s\S]*?)<\/(?:s|strike|del)>/gi, '~~$1~~');
+      s = s.replace(/<\/?(?:b|strong|i|em|s|strike|del)\b[^>]*>/gi, '');
+
+      const frag = document.createDocumentFragment();
+      const tokenRegex = /(\*\*[^*]+?\*\*|__[^_]+?__|~~[^~]+?~~|`[^`]+?`|\*[^*\s][^*]*?[^*\s]\*)/g;
+
+      let lastIdx = 0;
+      let match;
+      while ((match = tokenRegex.exec(s)) !== null) {
+        if (match.index > lastIdx) {
+          const before = s.slice(lastIdx, match.index).replace(/\*\*|__|`/g, '');
+          if (before) frag.appendChild(document.createTextNode(before));
+        }
+        const tok = match[0];
+        if ((tok.startsWith('**') && tok.endsWith('**')) || (tok.startsWith('__') && tok.endsWith('__'))) {
+          const el = document.createElement('strong');
+          el.textContent = tok.slice(2, -2).replace(/\*\*|__|`/g, '');
+          frag.appendChild(el);
+        } else if (tok.startsWith('~~') && tok.endsWith('~~')) {
+          const el = document.createElement('del');
+          el.textContent = tok.slice(2, -2);
+          frag.appendChild(el);
+        } else if (tok.startsWith('`') && tok.endsWith('`')) {
+          frag.appendChild(document.createTextNode(tok.slice(1, -1)));
+        } else if (tok.startsWith('*') && tok.endsWith('*')) {
+          const el = document.createElement('em');
+          el.textContent = tok.slice(1, -1);
+          frag.appendChild(el);
+        }
+        lastIdx = tokenRegex.lastIndex;
+      }
+
+      if (lastIdx < s.length) {
+        const tail = s.slice(lastIdx).replace(/\*\*|__|`/g, '');
+        if (tail) frag.appendChild(document.createTextNode(tail));
+      }
+      return frag;
+    }
+
+    function cleanExistingArticleHtml(dirtyHtml) {
+      if (!dirtyHtml) return '';
+      const parser = new DOMParser();
+      const parsed = parser.parseFromString(String(dirtyHtml), 'text/html');
+
+      // Remove parágrafos que contenham apenas cabeçalho/rodapé de impressão ou cercas ```
+      Array.from(parsed.body.querySelectorAll('p, div')).forEach(el => {
+        if (el.children.length === 0 && isPrintNoiseText(el.textContent)) {
+          el.remove();
+        }
+      });
+
+      // Higieniza apenas os nós de texto preservando <mark>, <span style="...">, etc.
+      const walker = document.createTreeWalker(parsed.body, NodeFilter.SHOW_TEXT);
+      const textNodes = [];
+      let current;
+      while ((current = walker.nextNode())) {
+        textNodes.push(current);
+      }
+
+      for (const tNode of textNodes) {
+        const orig = tNode.nodeValue || '';
+        if (!orig) continue;
+        const hasArtifacts =
+          /[\uE000-\uF8FF]|\*\*|__|~~|`|\\[$*_[\]]|<\/?(?:u|b|i|s|a|span|font|div|p|strong|em|del)\b|\[URL|\]\(https?:|planalto\.gov\.br|\d{1,2}\/\d{1,2}\/\d{2,4},?\s+\d{1,2}:\d{2}/i.test(orig);
+        if (!hasArtifacts) continue;
+
+        const frag = cleanTextNodeToFragment(orig);
+        tNode.parentNode?.replaceChild(frag, tNode);
+      }
+
+      Array.from(parsed.body.querySelectorAll('p')).forEach(p => {
+        if (!p.textContent.trim() && p.querySelectorAll('br').length === 0) {
+          p.remove();
+        }
+      });
+
+      return sanitizeHtml(parsed.body.innerHTML);
+    }
+
+    /**
+     * Ação do botão "Limpar tags MD": percorre todos os artigos da lei aberta,
+     * remove tags/artefatos literais já salvos no Firestore mantendo grifos e observações.
+     */
+    async function cleanMarkdownTagsInActiveLaw() {
+      if (!currentUser || !activeLawDoc || !activeLawDoc.articles?.length) {
+        showToast('Nenhuma lei aberta para limpar.', 'info');
+        return;
+      }
+      if (editingArticleId) finishEditing(editingArticleId, false);
+
+      const btn = document.getElementById('cleanMdTagsBtn');
+      if (btn) btn.disabled = true;
+
+      try {
+        let cleanedCount = 0;
+        for (const art of activeLawDoc.articles) {
+          const newHtml = cleanExistingArticleHtml(art.html);
+          const newOrig = cleanExistingArticleHtml(art.originalHtml);
+          const newSection = String(art.sectionHeader || '')
+            .replace(/[\uE000-\uF8FF]/g, '')
+            .replace(/\*\*|__|`/g, '')
+            .trim();
+
+          if (newHtml !== art.html || newOrig !== art.originalHtml || newSection !== art.sectionHeader) {
+            art.html = newHtml;
+            art.originalHtml = newOrig;
+            art.sectionHeader = newSection;
+            cleanedCount++;
+          }
+        }
+
+        if (cleanedCount === 0) {
+          showToast('Nenhum artefato Markdown/HTML encontrado nesta lei.', 'info');
+          return;
+        }
+
+        hasLocalUnsavedLawChanges = true;
+        setSyncStatus('saving', 'Salvando limpeza...');
+        await saveLawToCloud(currentUser.uid, activeLawDoc, {
+          onProgress: (done, total) => {
+            setSyncStatus('saving', `Salvando limpeza (bloco ${done} de ${total})...`);
+          }
+        });
+        hasLocalUnsavedLawChanges = false;
+        setSyncStatus('synced');
+        renderArticles();
+        showToast(`Limpeza concluída: ${cleanedCount} artigo(s) higienizados na nuvem!`);
+      } catch (err) {
+        console.error('Erro ao limpar tags MD:', err);
+        hasLocalUnsavedLawChanges = false;
+        setSyncStatus('error', 'Offline / Erro');
+        showToast(translateFirebaseError(err), 'error');
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
     function updateImportPreview() {
       const raw = document.getElementById('importRawText').value;
       const box = document.getElementById('importPreviewBox');
@@ -3241,9 +3991,15 @@
         extractMods: document.getElementById('optExtractMods').checked
       };
       const result = parseLawText(raw, opts);
+      const estBytes = getUtf8ByteSize(result.articles.map(serializeArticleForStorage));
+      const estChunks = estBytes > CHUNK_TARGET_BYTES
+        ? Math.ceil(estBytes / CHUNK_TARGET_BYTES)
+        : 1;
+
       box.classList.remove('hidden');
       document.getElementById('importPreviewStats').textContent =
-        `${result.articles.length} artigo(s) • ${result.totalModsExtracted} modificação(ões) extraída(s)`;
+        `${result.articles.length} artigo(s) • ${result.totalModsExtracted} modificação(ões) • ~${Math.max(1, Math.round(estBytes / 1024))} KB` +
+        (estChunks > 1 ? ` (${estChunks} blocos)` : '');
 
       document.getElementById('importPreviewList').innerHTML =
         result.articles.slice(0, 4).map(a => `
@@ -3268,7 +4024,11 @@
       if (!lawTitle || !rawText) return;
 
       const submitBtn = document.getElementById('importSubmitBtn');
-      if (submitBtn) submitBtn.disabled = true;
+      const originalBtnText = submitBtn?.textContent || 'Importar e Salvar na Nuvem';
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Processando texto...';
+      }
       setSyncStatus('saving', 'Importando lei...');
 
       try {
@@ -3277,7 +4037,6 @@
           const newSubName = document.getElementById('importNewSubjectInput').value.trim();
           if (!newSubName) {
             showToast('Informe o nome da nova matéria.', 'error');
-            if (submitBtn) submitBtn.disabled = false;
             return;
           }
           targetSubjectId = generateId('sub');
@@ -3298,17 +4057,26 @@
         const subtitle = `Importada em ${new Date().toLocaleDateString('pt-BR')}`;
         const order = workspace.lawIndex.filter(l => l.subjectId === targetSubjectId).length + 1;
 
-        const newLawDoc = {
+        const newLawObj = {
           id: lawId,
           subjectId: targetSubjectId,
           shortName,
           title: lawTitle,
           subtitle,
           order,
-          articles: parsed.articles,
-          createdAt: Date.now(),
-          updatedAt: Date.now()
+          chunked: false,
+          articles: parsed.articles
         };
+
+        // Salva na nuvem com chunking automático e feedback de progresso por bloco
+        const saveRes = await saveLawToCloud(currentUser.uid, newLawObj, {
+          skipChunkCleanup: true,
+          onProgress: (done, total) => {
+            const label = `Salvando ${shortName} (bloco ${done} de ${total})...`;
+            setSyncStatus('saving', label);
+            if (submitBtn) submitBtn.textContent = label;
+          }
+        });
 
         workspace.lawIndex.push({
           id: lawId,
@@ -3322,31 +4090,32 @@
         workspace.preferences.activeSubjectId = targetSubjectId;
         workspace.preferences.activeLawId = lawId;
 
-        const batch = writeBatch(db);
-        batch.set(lawDocRef(currentUser.uid, lawId), newLawDoc);
-        batch.set(workspaceDocRef(currentUser.uid), {
+        await setDoc(workspaceDocRef(currentUser.uid), {
           preferences: workspace.preferences,
           subjects: workspace.subjects,
           lawIndex: workspace.lawIndex,
           updatedAt: Date.now()
         }, { merge: true });
-        await batch.commit();
 
         closeModal('importModal');
         toggleSidebar(false);
         setSyncStatus('synced');
-        showToast(`"${lawTitle}" salva na nuvem com ${parsed.articles.length} artigo(s)!`);
+        const chunkMsg = saveRes.chunked ? ` em ${saveRes.chunkCount} blocos` : '';
+        showToast(`"${lawTitle}" salva na nuvem (${parsed.articles.length} artigos${chunkMsg})!`);
       } catch (err) {
         console.error('Erro ao importar lei:', err);
         setSyncStatus('error', 'Offline / Erro');
         showToast(translateFirebaseError(err), 'error');
       } finally {
-        if (submitBtn) submitBtn.disabled = false;
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = originalBtnText;
+        }
       }
     }
 
     // -----------------------------------------------------------------------
-    // 14. BACKUP JSON COMPLETO (EXPORTAR E RESTAURAR PARA O FIRESTORE)
+    // 14. BACKUP JSON COMPLETO (EXPORTAR E RESTAURAR COM SUPORTE A CHUNKS)
     // -----------------------------------------------------------------------
     function openBackupModal() {
       const input = document.getElementById('backupJsonInput');
@@ -3360,11 +4129,24 @@
         setSyncStatus('saving', 'Exportando...');
         const snap = await getDocs(lawsCollectionRef(currentUser.uid));
         const allLaws = [];
-        snap.forEach(d => allLaws.push({ id: d.id, ...d.data() }));
+
+        for (const d of snap.docs) {
+          const data = d.data();
+          const loaded = await loadLawArticlesFromCloud(currentUser.uid, d.id, data);
+          allLaws.push({
+            id: d.id,
+            subjectId: data.subjectId || '',
+            shortName: data.shortName || data.title || 'Lei',
+            title: data.title || 'Lei',
+            subtitle: data.subtitle || '',
+            order: Number(data.order) || 1,
+            articles: loaded.articles
+          });
+        }
 
         const payload = {
           app: 'Lei Seca Studio',
-          version: 3,
+          version: 4,
           exportedAt: new Date().toISOString(),
           workspace,
           laws: allLaws
@@ -3417,10 +4199,16 @@
             throw new Error('Arquivo JSON inválido ou sem matérias.');
           }
 
-          setSyncStatus('saving', 'Restaurando backup...');
+          setSyncStatus('saving', 'Limpando dados anteriores...');
           const existingSnap = await getDocs(lawsCollectionRef(currentUser.uid));
-          const batch = writeBatch(db);
-          existingSnap.forEach(d => batch.delete(lawDocRef(currentUser.uid, d.id)));
+          for (const d of existingSnap.docs) {
+            await deleteLawChunks(currentUser.uid, d.id, 0);
+          }
+          for (let i = 0; i < existingSnap.docs.length; i += MAX_BATCH_OPS) {
+            const batch = writeBatch(db);
+            existingSnap.docs.slice(i, i + MAX_BATCH_OPS).forEach(d => batch.delete(d.ref));
+            await batch.commit();
+          }
 
           const cleanSubjects = importedSubjects.map((s, idx) => ({
             id: s.id || generateId('sub'),
@@ -3429,46 +4217,48 @@
           }));
 
           const cleanLawIndex = [];
-          importedLaws.forEach((l, idx) => {
+          for (let idx = 0; idx < importedLaws.length; idx++) {
+            const l = importedLaws[idx];
             const lid = l.id || generateId('law');
             const sid = l.subjectId || cleanSubjects[0].id;
-            const cleanArticles = (l.articles || []).map(a => ({
-              id: a.id || generateId('art'),
-              number: String(a.number || ''),
-              sectionHeader: String(a.sectionHeader || ''),
-              originalHtml: sanitizeHtml(a.originalHtml || ''),
-              html: sanitizeHtml(a.html || ''),
-              note: String(a.note || ''),
-              modifications: Array.isArray(a.modifications) ? a.modifications : []
-            }));
+            const hydratedArticles = (l.articles || []).map(hydrateArticleFromStorage);
 
-            const docPayload = {
+            const lawObj = {
               id: lid,
               subjectId: sid,
               shortName: String(l.shortName || l.title || 'Lei'),
               title: String(l.title || 'Lei'),
               subtitle: String(l.subtitle || ''),
               order: Number(l.order) || idx + 1,
-              articles: cleanArticles,
-              updatedAt: Date.now()
+              chunked: false,
+              articles: hydratedArticles
             };
 
-            batch.set(lawDocRef(currentUser.uid, lid), docPayload);
+            setSyncStatus('saving', `Restaurando ${lawObj.shortName}...`);
+            await saveLawToCloud(currentUser.uid, lawObj, {
+              skipChunkCleanup: true,
+              onProgress: (done, total) => {
+                setSyncStatus('saving', `Restaurando ${lawObj.shortName} (bloco ${done} de ${total})...`);
+              }
+            });
+
             cleanLawIndex.push({
               id: lid,
               subjectId: sid,
-              shortName: docPayload.shortName,
-              title: docPayload.title,
-              subtitle: docPayload.subtitle,
-              order: docPayload.order,
-              articleCount: cleanArticles.length
+              shortName: lawObj.shortName,
+              title: lawObj.title,
+              subtitle: lawObj.subtitle,
+              order: lawObj.order,
+              articleCount: hydratedArticles.length
             });
-          });
+          }
 
           const firstLaw = cleanLawIndex[0] || null;
-          batch.set(workspaceDocRef(currentUser.uid), {
+          await setDoc(workspaceDocRef(currentUser.uid), {
             preferences: {
-              darkMode: Boolean(parsed.workspace?.preferences?.darkMode),
+              darkMode: parsed.workspace?.preferences?.darkMode !== undefined
+                ? Boolean(parsed.workspace.preferences.darkMode)
+                : true,
               fontSize: Number(parsed.workspace?.preferences?.fontSize) || 16,
               fontFamily: parsed.workspace?.preferences?.fontFamily === 'serif' ? 'serif' : 'sans',
               activeSubjectId: firstLaw ? firstLaw.subjectId : cleanSubjects[0].id,
@@ -3479,7 +4269,6 @@
             updatedAt: Date.now()
           });
 
-          await batch.commit();
           closeModal('backupModal');
           setSyncStatus('synced');
           showToast('Backup restaurado e sincronizado na nuvem!');
@@ -3507,6 +4296,9 @@
       selectLaw,
       handleSearch,
       clearSearch,
+      handleJumpToArticle,
+      loadMoreArticles,
+      showAllArticles,
       toggleAnnotatedFilter,
       toggleModsFilter,
       resetAllFilters,
@@ -3538,6 +4330,7 @@
       handleImportFileSelected,
       updateImportPreview,
       handleImportLaw,
+      cleanMarkdownTagsInActiveLaw,
       openBackupModal,
       exportBackupJSON,
       importBackupJSON,
