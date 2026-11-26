@@ -572,6 +572,43 @@
       return matches[matches.length - 1].replace(/^\(|\)$/g, '').trim();
     }
 
+    // Anotações legislativas inline do Planalto: "(Redação dada pela...)", "(Incluído pela...)", "(Revogado...)" etc.
+    // "Vide ...", "Regulamento" e "Vigência" também entram (aparecem em outra cor no histórico).
+    const MOD_ANNOTATION_SOURCE = '\\((?:Redação dada|Incluíd[oa]|Revogad[oa]|Renumerad[oa]|Transformad[oa]|Alterad[oa]|Suprimid[oa]|Vide|Regulamento|Vigência)[^()]*\\)';
+
+    function extractInlineModificationsFromTexts(texts) {
+      const out = [];
+      const seen = new Set();
+      for (const raw of texts) {
+        const text = String(raw || '').replace(/\*\*|__/g, '').replace(/\s+/g, ' ').trim();
+        if (!text) continue;
+        const matches = text.match(new RegExp(MOD_ANNOTATION_SOURCE, 'gi'));
+        if (!matches) continue;
+        const clean = text
+          .replace(new RegExp(MOD_ANNOTATION_SOURCE, 'gi'), '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        const snippet = clean.length > 130 ? clean.slice(0, 130).trimEnd() + '…' : (clean || '(dispositivo)');
+        for (const m of matches) {
+          const norm = m.replace(/^\(|\)$/g, '').trim();
+          const key = `${norm}|${snippet}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push({ id: generateId('mod'), kind: 'auto', oldText: '', newText: snippet, norm, date: '' });
+        }
+      }
+      return out;
+    }
+
+    // Recalcula as modificações detectadas automaticamente (mantém as registradas manualmente)
+    function refreshAutoModifications(art) {
+      const manual = (Array.isArray(art.modifications) ? art.modifications : []).filter(m => m.kind !== 'auto');
+      const texts = extractParagraphBlocks(art.originalHtml || art.html).map(b => b.text);
+      const auto = extractInlineModificationsFromTexts(texts);
+      art.modifications = manual.concat(auto);
+      return auto.length;
+    }
+
     /**
      * Parser inteligente de texto/Markdown de legislação brasileira (Planalto):
      * - Remove cercas de código, glifos, LaTeX de sobrescrito, cabeçalhos/rodapés de impressão e tags HTML sujas.
@@ -617,7 +654,13 @@
           insideSignatureBlock = true;
           continue;
         }
-        if (/^ATO DAS DISPOSIÇÕES CONSTITUCIONAIS TRANSITÓRIAS$/i.test(line)) {
+        // Item de índice no topo do arquivo (ex.: "Ato das Disposições Constitucionais Transitórias"): ignora
+        if (articles.length === 0 && !/^ATO DAS DISPOSIÇÕES CONSTITUCIONAIS TRANSITÓRIAS$/.test(line) &&
+            /^ATO DAS DISPOSIÇÕES CONSTITUCIONAIS TRANSITÓRIAS$/i.test(line)) {
+          continue;
+        }
+        // O título real do ADCT vem em CAIXA ALTA; a versão em Title Case é só referência/índice
+        if (/^ATO DAS DISPOSIÇÕES CONSTITUCIONAIS TRANSITÓRIAS$/.test(line)) {
           insideSignatureBlock = false;
           currentMajorScope = 'ADCT';
           currentArticle = null;
@@ -714,7 +757,10 @@
           originalHtml: html,
           note: a.note || '',
           updateBadge: '',
-          modifications: a.modifications || []
+          modifications: [
+            ...(a.modifications || []),
+            ...extractInlineModificationsFromTexts(a._lines)
+          ]
         };
       });
     }
@@ -1083,7 +1129,8 @@
           oldText: String(m.oldText || ''),
           newText: String(m.newText || ''),
           norm: String(m.norm || ''),
-          date: String(m.date || '')
+          date: String(m.date || ''),
+          ...(m.kind === 'auto' ? { kind: 'auto' } : {})
         }));
       }
       return out;
@@ -1904,6 +1951,10 @@
                           <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                         </svg>
                         <span>Atualizar Lei</span>
+                      </button>
+                      <button type="button" onclick="detectModificationsCurrentLaw()" title="Lê as anotações (Redação dada..., Incluído..., Revogado...) do texto e preenche o botão Modif. de cada artigo"
+                        class="px-3 py-1.5 rounded-xl text-xs font-semibold border border-violet-300 dark:border-violet-700/80 bg-violet-50 dark:bg-violet-950/40 hover:bg-violet-100 dark:hover:bg-violet-950/70 text-violet-700 dark:text-violet-300 transition-colors">
+                        Detectar modificações
                       </button>
                       <button type="button" onclick="cleanCurrentLawMarkdown()" title="Limpa tags literais como **<u>caput</u>** preservando seus grifos e observações"
                         class="px-3 py-1.5 rounded-xl text-xs font-semibold border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 transition-colors">
@@ -2770,12 +2821,12 @@
         ? art.modifications.map(m => `
             <div class="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700/80 space-y-1.5">
               <div class="flex items-start justify-between gap-2">
-                <span class="text-[11px] font-bold text-violet-700 dark:text-violet-300">${escapeHtml(m.norm || 'Alteração legislativa')}</span>
+                <span class="text-[11px] font-bold ${/^(Vide|Regulamento|Vigência)/i.test(m.norm || '') ? 'text-sky-700 dark:text-sky-300' : 'text-violet-700 dark:text-violet-300'}">${escapeHtml(m.norm || 'Alteração legislativa')}</span>
                 <button type="button" onclick="deleteModification('${art.id}', '${m.id}')" title="Remover registro"
                   class="text-[11px] text-slate-400 hover:text-rose-500">Remover</button>
               </div>
-              <p class="text-xs text-slate-500 dark:text-slate-400 line-through leading-relaxed whitespace-pre-line">${escapeHtml(m.oldText || '')}</p>
-              ${m.newText ? `<p class="text-xs text-slate-700 dark:text-slate-200 leading-relaxed whitespace-pre-line"><span class="font-semibold text-emerald-600 dark:text-emerald-400">Nova redação:</span> ${escapeHtml(m.newText)}</p>` : ''}
+              ${m.oldText ? `<p class="text-xs text-slate-500 dark:text-slate-400 line-through leading-relaxed whitespace-pre-line">${escapeHtml(m.oldText)}</p>` : ''}
+              ${m.newText ? `<p class="text-xs text-slate-700 dark:text-slate-200 leading-relaxed whitespace-pre-line"><span class="font-semibold text-emerald-600 dark:text-emerald-400">${m.kind === 'auto' ? 'Dispositivo:' : 'Nova redação:'}</span> ${escapeHtml(m.newText)}</p>` : ''}
             </div>
           `).join('')
         : `<p class="text-xs text-slate-400 italic">Nenhuma modificação legislativa registrada para este artigo.</p>`;
@@ -3164,6 +3215,32 @@
       rerenderSingleArticleCard(articleId);
       renderHeader(getFilteredArticles().length);
       showToast('Registro de modificação removido.', 'info');
+    }
+
+    function detectModificationsCurrentLaw() {
+      if (!activeLawDoc || !activeLawDoc.articles.length) return;
+      if (editingArticleId) {
+        captureEditedArticleBody(editingArticleId, true);
+        editingArticleId = null;
+      }
+      const sig = art => (art.modifications || []).filter(m => m.kind === 'auto').map(m => `${m.norm}|${m.newText}`).join('\n');
+      let totalDetected = 0;
+      let articlesWithMods = 0;
+      let articlesChanged = 0;
+      for (const art of activeLawDoc.articles) {
+        const before = sig(art);
+        const found = refreshAutoModifications(art);
+        if (found > 0) { totalDetected += found; articlesWithMods++; }
+        if (sig(art) !== before) articlesChanged++;
+      }
+      if (articlesChanged === 0) {
+        showToast(totalDetected > 0 ? 'As modificações desta lei já estavam atualizadas.' : 'Nenhuma anotação de modificação encontrada no texto desta lei.', 'info');
+        renderMainView();
+        return;
+      }
+      scheduleSaveActiveLaw({ full: true, immediate: true });
+      renderMainView();
+      showToast(`${totalDetected} modificações detectadas em ${articlesWithMods} artigos.`, 'success');
     }
 
     function cleanCurrentLawMarkdown() {
@@ -4386,6 +4463,7 @@
           }
         }
 
+        resultArticles.forEach(refreshAutoModifications);
         activeLawDoc.articles = resultArticles;
 
         await saveFullLawToFirestore(currentUser.uid, activeLawDoc, (done, total) => {
@@ -4548,6 +4626,7 @@
       handleAddModification,
       deleteModification,
       cleanCurrentLawMarkdown,
+      detectModificationsCurrentLaw,
       openModal,
       closeModal,
       closeConfirmModal,
