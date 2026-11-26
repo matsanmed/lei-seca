@@ -225,6 +225,10 @@
     let filterAnnotatedOnly = false;
     let filterModsOnly = false;
     let filterUpdatedOnly = false;
+    let filterFavoritesOnly = false;
+    let renameTargetLawId = null;
+    let tocMode = 'structure'; // 'structure' | 'articles'
+    let tocQuery = '';
     let visibleArticlesLimit = INITIAL_VISIBLE_ARTICLES;
     let editingArticleId = null;
     let openNotes = new Set();
@@ -1067,6 +1071,9 @@
       if (art.note && String(art.note).trim()) {
         out.note = String(art.note);
       }
+      if (art.favorite === true) {
+        out.favorite = true;
+      }
       if (art.updateBadge === 'new' || art.updateBadge === 'updated') {
         out.updateBadge = art.updateBadge;
       }
@@ -1092,6 +1099,7 @@
         html: html,
         originalHtml: orig,
         note: raw.note || '',
+        favorite: raw.favorite === true,
         updateBadge: (raw.updateBadge === 'new' || raw.updateBadge === 'updated') ? raw.updateBadge : '',
         modifications: Array.isArray(raw.modifications) ? raw.modifications : []
       };
@@ -1871,12 +1879,25 @@
                           Legislação
                         </span>
                         <span id="lawShortChip" class="text-xs font-semibold text-slate-400 dark:text-slate-500"></span>
+                        <button type="button" onclick="openRenameLawModal()" title="Renomear esta lei" aria-label="Renomear esta lei"
+                          class="p-1 rounded-lg text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 transition-colors">
+                          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                          </svg>
+                        </button>
                       </div>
                       <h1 id="lawMainTitle" class="text-xl sm:text-2xl font-bold text-slate-900 dark:text-white tracking-tight"></h1>
                       <p id="lawSubtitle" class="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mt-1"></p>
                     </div>
 
                     <div class="flex flex-wrap items-center gap-2">
+                      <button type="button" onclick="openTocModal()" title="Sumário da lei: títulos, capítulos e artigos"
+                        class="px-3 py-1.5 rounded-xl text-xs font-semibold border border-indigo-300 dark:border-indigo-700/80 bg-indigo-50 dark:bg-indigo-950/40 hover:bg-indigo-100 dark:hover:bg-indigo-950/70 text-indigo-700 dark:text-indigo-300 flex items-center gap-1.5 transition-colors">
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h10M4 18h16" />
+                        </svg>
+                        <span>Sumário</span>
+                      </button>
                       <button type="button" onclick="openUpdateLawModal()" title="Subir novo .md/.txt desta lei preservando grifos, cores e observações"
                         class="px-3 py-1.5 rounded-xl text-xs font-semibold border border-emerald-300 dark:border-emerald-700/80 bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 dark:hover:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300 flex items-center gap-1.5 transition-colors">
                         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
@@ -1898,6 +1919,10 @@
                   <!-- Filtros rápidos e estatísticas -->
                   <div class="mt-4 flex flex-wrap items-center justify-between gap-2">
                     <div class="flex flex-wrap items-center gap-2">
+                      <button type="button" id="filterFavoritesBtn" onclick="toggleFavoritesFilter()"
+                        class="px-3 py-1.5 rounded-xl text-xs font-semibold border border-amber-300 dark:border-amber-700/80 bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-300 transition-colors">
+                        ★ Favoritos
+                      </button>
                       <button type="button" id="filterAnnotatedBtn" onclick="toggleAnnotatedFilter()"
                         class="px-3 py-1.5 rounded-xl text-xs font-semibold border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:border-indigo-400 transition-colors">
                         Apenas com anotações/grifos
@@ -1959,6 +1984,62 @@
                 <button type="submit" class="px-4 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white">Salvar Nome</button>
               </div>
             </form>
+          </div>
+        </div>
+
+        <!-- Modal: Renomear Lei -->
+        <div id="renameLawModal" class="fixed inset-0 z-50 hidden items-center justify-center p-4 bg-slate-950/60 backdrop-blur-xs">
+          <div class="w-full max-w-md rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-2xl p-6">
+            <h3 class="text-lg font-bold text-slate-900 dark:text-white mb-4">Editar nome da lei</h3>
+            <form onsubmit="handleRenameLaw(event)" class="space-y-3.5">
+              <div>
+                <label class="block text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1">Nome curto (menu lateral)</label>
+                <input id="renameLawShortInput" type="text" required placeholder="Ex.: CF/88, LGPD"
+                  class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+              </div>
+              <div>
+                <label class="block text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1">Título completo</label>
+                <input id="renameLawTitleInput" type="text" required placeholder="Ex.: Constituição Federal de 1988"
+                  class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+              </div>
+              <div>
+                <label class="block text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1">Subtítulo (opcional)</label>
+                <input id="renameLawSubtitleInput" type="text" placeholder="Ex.: Texto compilado do Planalto"
+                  class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+              </div>
+              <div class="flex justify-end gap-2 pt-1">
+                <button type="button" onclick="closeModal('renameLawModal')" class="px-4 py-2 rounded-xl text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800">Cancelar</button>
+                <button type="submit" class="px-4 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white">Salvar</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <!-- Modal: Sumário da Lei -->
+        <div id="tocModal" class="fixed inset-0 z-50 hidden items-center justify-center p-4 bg-slate-950/60 backdrop-blur-xs"
+          onclick="if(event.target===this) closeModal('tocModal')">
+          <div class="w-full max-w-2xl max-h-[85vh] flex flex-col rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-2xl">
+            <div class="px-5 pt-5 pb-3 border-b border-slate-200 dark:border-slate-800">
+              <div class="flex items-start justify-between gap-3">
+                <div class="min-w-0">
+                  <h3 class="text-lg font-bold text-slate-900 dark:text-white">Sumário</h3>
+                  <p id="tocLawName" class="text-xs text-slate-500 dark:text-slate-400 truncate"></p>
+                </div>
+                <button type="button" onclick="closeModal('tocModal')" aria-label="Fechar sumário"
+                  class="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">
+                  <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+                </button>
+              </div>
+              <div class="mt-3 flex items-center gap-2">
+                <div class="inline-flex rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden text-xs font-semibold shrink-0">
+                  <button type="button" id="tocTabStructure" onclick="setTocMode('structure')" class="px-3 py-1.5 transition-colors">Estrutura</button>
+                  <button type="button" id="tocTabArticles" onclick="setTocMode('articles')" class="px-3 py-1.5 transition-colors">Artigos</button>
+                </div>
+                <input id="tocSearchInput" type="search" oninput="handleTocSearch(this.value)" placeholder="Filtrar sumário..."
+                  class="flex-1 min-w-0 px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+              </div>
+            </div>
+            <div id="tocBody" class="flex-1 overflow-y-auto p-3 sm:p-4"></div>
           </div>
         </div>
 
@@ -2281,6 +2362,13 @@
                         </span>
                       </button>
                       <div class="flex items-center shrink-0 opacity-75 sm:opacity-0 sm:group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                        <button type="button" onclick="openRenameLawModal('${law.id}')" title="Renomear lei"
+                          class="p-1.5 rounded-lg text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 transition-colors"
+                          aria-label="Renomear lei">
+                          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                          </svg>
+                        </button>
                         <button type="button" onclick="toggleArchiveLaw('${law.id}')" title="Arquivar lei"
                           class="p-1.5 rounded-lg text-slate-400 hover:text-amber-600 dark:hover:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/40 transition-colors"
                           aria-label="Arquivar lei">
@@ -2501,6 +2589,9 @@
         if (filterUpdatedOnly) {
           if (!art.updateBadge) return false;
         }
+        if (filterFavoritesOnly) {
+          if (!art.favorite) return false;
+        }
         if (q) {
           const hay = normalizeSearch(
             `${art.number} ${art.sectionHeader || ''} ${stripHtmlToText(art.html)} ${art.note || ''}`
@@ -2557,6 +2648,21 @@
       const editedCount = articles.filter(a => a.html !== a.originalHtml).length;
       const modsCount = articles.filter(a => a.modifications && a.modifications.length > 0).length;
       const recentUpdatedCount = articles.filter(a => Boolean(a.updateBadge)).length;
+      const favCount = articles.filter(a => a.favorite === true).length;
+
+      const btnFav = document.getElementById('filterFavoritesBtn');
+      if (btnFav) {
+        btnFav.className = `px-3 py-1.5 rounded-xl text-xs font-semibold border transition-colors flex items-center gap-1.5 ${
+          filterFavoritesOnly
+            ? 'bg-amber-500 text-white border-amber-500'
+            : 'border-amber-300 dark:border-amber-700/80 bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-300 hover:border-amber-500'
+        }`;
+        btnFav.innerHTML = `
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="${filterFavoritesOnly ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M11.48 3.499a.562.562 0 011.04 0l2.125 5.111a.563.563 0 00.475.345l5.518.442c.499.04.701.663.321.988l-4.204 3.602a.563.563 0 00-.182.557l1.285 5.385a.562.562 0 01-.84.61l-4.725-2.885a.563.563 0 00-.586 0L6.982 20.54a.562.562 0 01-.84-.61l1.285-5.386a.563.563 0 00-.182-.557l-4.204-3.602a.563.563 0 01.321-.988l5.518-.442a.563.563 0 00.475-.345L11.48 3.5z" />
+          </svg>
+          <span>Favoritos (${favCount})</span>`;
+      }
 
       if (btnUpd) {
         if (recentUpdatedCount > 0) {
@@ -2583,7 +2689,7 @@
       if (chip) chip.textContent = activeLawDoc.shortName || activeLawDoc.title;
       if (subtitle) subtitle.textContent = activeLawDoc.subtitle || '';
       if (metrics) {
-        metrics.textContent = `Exibindo ${filteredCount} de ${total} artigos • ${editedCount} editados • ${notesCount} observações • ${modsCount} c/ modificações`;
+        metrics.textContent = `Exibindo ${filteredCount} de ${total} artigos • ${editedCount} editados • ${notesCount} observações • ${modsCount} c/ modificações • ${favCount} favoritos`;
       }
     }
 
@@ -2704,15 +2810,31 @@
 
       return `
         ${sectionDividerHtml}
-        <article id="card_${art.id}" class="rounded-2xl border-2 transition-all p-4 sm:p-5 bg-white dark:bg-slate-900/90 shadow-xs ${
+        <article id="card_${art.id}" class="relative rounded-2xl border-2 transition-all p-4 sm:p-5 bg-white dark:bg-slate-900/90 shadow-xs ${
           isEditing
             ? 'border-indigo-500 ring-2 ring-indigo-500/20'
-            : 'border-slate-200/90 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700'
+            : art.favorite
+              ? 'border-amber-300 dark:border-amber-600/60 hover:border-amber-400 dark:hover:border-amber-500'
+              : 'border-slate-200/90 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700'
         }">
+          ${isEditing ? '' : `
+            <button type="button" onclick="toggleFavoriteArticle('${art.id}')"
+              title="${art.favorite ? 'Remover dos favoritos' : 'Marcar como favorito'}"
+              aria-label="${art.favorite ? 'Remover dos favoritos' : 'Marcar como favorito'}" aria-pressed="${art.favorite ? 'true' : 'false'}"
+              class="absolute top-2.5 right-2.5 z-10 p-1.5 rounded-lg transition-colors ${
+                art.favorite
+                  ? 'text-amber-500 hover:text-amber-600 bg-amber-50 dark:bg-amber-950/40'
+                  : 'text-slate-300 dark:text-slate-600 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-950/30'
+              }">
+              <svg class="w-5 h-5" viewBox="0 0 24 24" fill="${art.favorite ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="1.8">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M11.48 3.499a.562.562 0 011.04 0l2.125 5.111a.563.563 0 00.475.345l5.518.442c.499.04.701.663.321.988l-4.204 3.602a.563.563 0 00-.182.557l1.285 5.385a.562.562 0 01-.84.61l-4.725-2.885a.563.563 0 00-.586 0L6.982 20.54a.562.562 0 01-.84-.61l1.285-5.386a.563.563 0 00-.182-.557l-4.204-3.602a.563.563 0 01.321-.988l5.518-.442a.563.563 0 00.475-.345L11.48 3.5z" />
+              </svg>
+            </button>
+          `}
           ${toolbarHtml}
 
           <div id="body_${art.id}"
-            class="article-body ${fontCls} text-slate-800 dark:text-slate-100"
+            class="article-body ${fontCls} text-slate-800 dark:text-slate-100 ${isEditing ? '' : 'pr-8'}"
             style="font-size: ${workspace.preferences.fontSize}px"
             ${isEditing ? `contenteditable="true" spellcheck="false" oninput="handleArticleBodyInput('${art.id}')"` : ''}>
             ${art.html}
@@ -3089,6 +3211,22 @@
       renderMainView();
     }
 
+    function toggleFavoritesFilter() {
+      filterFavoritesOnly = !filterFavoritesOnly;
+      visibleArticlesLimit = INITIAL_VISIBLE_ARTICLES;
+      renderMainView();
+    }
+
+    function toggleFavoriteArticle(articleId) {
+      if (!activeLawDoc) return;
+      const art = activeLawDoc.articles.find(a => a.id === articleId);
+      if (!art) return;
+      art.favorite = !art.favorite;
+      rerenderSingleArticleCard(articleId);
+      renderHeader(getFilteredArticles().length);
+      scheduleSaveActiveLaw({ articleId });
+    }
+
     function toggleUpdatedFilter() {
       filterUpdatedOnly = !filterUpdatedOnly;
       visibleArticlesLimit = INITIAL_VISIBLE_ARTICLES;
@@ -3130,6 +3268,7 @@
       filterAnnotatedOnly = false;
       filterModsOnly = false;
       filterUpdatedOnly = false;
+      filterFavoritesOnly = false;
       visibleArticlesLimit = INITIAL_VISIBLE_ARTICLES;
       const input = document.getElementById('searchInput');
       if (input) input.value = '';
@@ -3188,23 +3327,32 @@
 
       const chosen = matches[lastJumpMatchCursor];
 
-      // Limpa filtros ativos se necessário para garantir que o artigo esteja visível
-      if (searchQuery || filterAnnotatedOnly || filterModsOnly || filterUpdatedOnly) {
+      navigateToArticle(chosen.art.id);
+    }
+
+    // Leva até um artigo específico (limpa filtros, expande a paginação e rola até o cartão)
+    function navigateToArticle(articleId) {
+      if (!activeLawDoc) return;
+      const index = activeLawDoc.articles.findIndex(a => a.id === articleId);
+      if (index < 0) return;
+
+      if (searchQuery || filterAnnotatedOnly || filterModsOnly || filterUpdatedOnly || filterFavoritesOnly) {
         searchQuery = '';
         filterAnnotatedOnly = false;
         filterModsOnly = false;
         filterUpdatedOnly = false;
+        filterFavoritesOnly = false;
         const sInput = document.getElementById('searchInput');
         if (sInput) sInput.value = '';
       }
 
-      if (chosen.index >= visibleArticlesLimit) {
-        visibleArticlesLimit = chosen.index + 15;
+      if (index >= visibleArticlesLimit) {
+        visibleArticlesLimit = index + 15;
       }
       renderMainView();
 
       setTimeout(() => {
-        const card = document.getElementById(`card_${chosen.art.id}`);
+        const card = document.getElementById(`card_${articleId}`);
         if (card) {
           card.scrollIntoView({ behavior: 'smooth', block: 'center' });
           card.classList.remove('article-jump-highlight');
@@ -3213,6 +3361,154 @@
           setTimeout(() => card.classList.remove('article-jump-highlight'), 2400);
         }
       }, 40);
+    }
+
+    // -----------------------------------------------------------------------
+    // 13B. SUMÁRIO DA LEI (ESTRUTURA E ÍNDICE DE ARTIGOS)
+    // -----------------------------------------------------------------------
+    function tocLevelOf(label) {
+      const s = String(label || '').toUpperCase();
+      if (/^(ATO DAS|PREÂMBULO|LIVRO|PARTE)\b/.test(s)) return 0;
+      if (/^TÍTULO\b/.test(s)) return 1;
+      if (/^CAPÍTULO\b/.test(s)) return 2;
+      if (/^SUBSEÇÃO\b/.test(s)) return 4;
+      if (/^SEÇÃO\b/.test(s)) return 3;
+      return 1;
+    }
+
+    function isTocStructuralToken(token) {
+      return /^(LIVRO|PARTE|TÍTULO|CAPÍTULO|SEÇÃO|SUBSEÇÃO|ATO DAS DISPOSIÇÕES|PREÂMBULO|DISPOSIÇÕES)\b/i.test(token);
+    }
+
+    function buildTocStructure() {
+      if (!activeLawDoc) return [];
+      const arts = activeLawDoc.articles || [];
+      const entries = [];
+
+      arts.forEach((art, idx) => {
+        if (!art.sectionHeader) return;
+        const tokens = String(art.sectionHeader).split(' • ').map(t => t.trim()).filter(Boolean);
+        let current = null;
+        tokens.forEach(tok => {
+          if (isTocStructuralToken(tok) || !current) {
+            current = { label: tok, rawLevel: tocLevelOf(tok), startIdx: idx, artId: art.id };
+            entries.push(current);
+          } else {
+            current.label += ' — ' + tok;
+          }
+        });
+      });
+
+      // Compacta os níveis presentes em 0, 1, 2... para indentar de forma proporcional
+      const levels = Array.from(new Set(entries.map(e => e.rawLevel))).sort((a, b) => a - b);
+      entries.forEach(e => { e.rank = levels.indexOf(e.rawLevel); });
+
+      entries.forEach((e, i) => {
+        let endIdx = arts.length - 1;
+        for (let j = i + 1; j < entries.length; j++) {
+          if (entries[j].rawLevel <= e.rawLevel && entries[j].startIdx > e.startIdx) {
+            endIdx = entries[j].startIdx - 1;
+            break;
+          }
+        }
+        e.endIdx = Math.max(endIdx, e.startIdx);
+      });
+      return entries;
+    }
+
+    function tocShortNumber(number) {
+      return String(number || '').replace(/^art\.?\s*/i, '').trim();
+    }
+
+    function renderToc() {
+      const body = document.getElementById('tocBody');
+      const nameEl = document.getElementById('tocLawName');
+      const tabS = document.getElementById('tocTabStructure');
+      const tabA = document.getElementById('tocTabArticles');
+      if (!body || !activeLawDoc) return;
+
+      if (nameEl) nameEl.textContent = activeLawDoc.shortName || activeLawDoc.title || '';
+      const activeCls = 'px-3 py-1.5 transition-colors bg-indigo-600 text-white';
+      const idleCls = 'px-3 py-1.5 transition-colors bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700';
+      if (tabS) tabS.className = tocMode === 'structure' ? activeCls : idleCls;
+      if (tabA) tabA.className = tocMode === 'articles' ? activeCls : idleCls;
+
+      const q = normalizeSearch(tocQuery.trim());
+      const arts = activeLawDoc.articles;
+
+      if (tocMode === 'structure') {
+        let entries = buildTocStructure();
+        if (entries.length === 0) {
+          body.innerHTML = `<p class="text-xs text-slate-500 dark:text-slate-400 text-center py-8">Esta lei não tem títulos ou capítulos identificados.<br/>Use a aba <strong>Artigos</strong> para navegar pelos números.</p>`;
+          return;
+        }
+        if (q) entries = entries.filter(e => normalizeSearch(e.label).includes(q));
+        if (entries.length === 0) {
+          body.innerHTML = `<p class="text-xs text-slate-400 text-center py-8">Nada encontrado para "${escapeHtml(tocQuery)}".</p>`;
+          return;
+        }
+        body.innerHTML = `<div class="space-y-0.5">` + entries.map(e => {
+          const first = arts[e.startIdx]?.number || '';
+          const last = arts[e.endIdx]?.number || '';
+          const range = e.startIdx === e.endIdx ? first : `${first} a ${tocShortNumber(last)}`;
+          const strong = e.rank <= 1;
+          return `
+            <button type="button" onclick="goToTocArticle('${escapeHtml(e.artId)}')"
+              style="margin-left: ${Math.min(e.rank, 4) * 14}px; width: calc(100% - ${Math.min(e.rank, 4) * 14}px)"
+              class="text-left px-3 py-2 rounded-lg flex items-center justify-between gap-3 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 transition-colors">
+              <span class="text-sm ${strong ? 'font-bold text-slate-900 dark:text-slate-100' : 'font-medium text-slate-700 dark:text-slate-300'}">${escapeHtml(e.label)}</span>
+              <span class="text-[11px] shrink-0 text-slate-400 dark:text-slate-500">${escapeHtml(range)}</span>
+            </button>`;
+        }).join('') + `</div>`;
+        return;
+      }
+
+      // Modo "Artigos": grade com todos os números
+      const chips = [];
+      arts.forEach(art => {
+        const short = tocShortNumber(art.number);
+        if (q && !normalizeSearch(short).includes(q)) return;
+        const fav = art.favorite === true;
+        chips.push(`
+          <button type="button" onclick="goToTocArticle('${escapeHtml(art.id)}')" title="${escapeHtml(art.number)}${fav ? ' (favorito)' : ''}"
+            class="px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors ${
+              fav
+                ? 'bg-amber-50 dark:bg-amber-950/40 border-amber-300 dark:border-amber-700 text-amber-800 dark:text-amber-300 hover:border-amber-500'
+                : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:border-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-950/40'
+            }">${fav ? '★ ' : ''}${escapeHtml(short)}</button>`);
+      });
+      body.innerHTML = chips.length === 0
+        ? `<p class="text-xs text-slate-400 text-center py-8">Nenhum artigo encontrado para "${escapeHtml(tocQuery)}".</p>`
+        : `<div class="flex flex-wrap gap-1.5">${chips.join('')}</div>`;
+    }
+
+    function openTocModal() {
+      if (!activeLawDoc || !activeLawDoc.articles.length) {
+        showToast('Abra uma lei com artigos para ver o sumário.', 'info');
+        return;
+      }
+      tocQuery = '';
+      const input = document.getElementById('tocSearchInput');
+      if (input) input.value = '';
+      tocMode = buildTocStructure().length > 0 ? 'structure' : 'articles';
+      renderToc();
+      openModal('tocModal');
+      setTimeout(() => input?.focus(), 40);
+    }
+
+    function setTocMode(mode) {
+      tocMode = mode === 'articles' ? 'articles' : 'structure';
+      renderToc();
+    }
+
+    function handleTocSearch(val) {
+      tocQuery = val || '';
+      renderToc();
+    }
+
+    function goToTocArticle(articleId) {
+      closeModal('tocModal');
+      navigateToArticle(articleId);
     }
 
     // -----------------------------------------------------------------------
@@ -3258,6 +3554,7 @@
       filterAnnotatedOnly = false;
       filterModsOnly = false;
       filterUpdatedOnly = false;
+      filterFavoritesOnly = false;
       lastJumpKey = '';
       lastJumpMatchCursor = -1;
       openNotes.clear();
@@ -3386,6 +3683,60 @@
       renderHeader(getFilteredArticles().length);
       scheduleSaveWorkspace(true);
       showToast('Nome da matéria atualizado.', 'success');
+    }
+
+    function openRenameLawModal(lawId) {
+      const id = lawId || activeLawDoc?.id || workspace.preferences.activeLawId;
+      const meta = workspace.lawIndex.find(l => l.id === id);
+      if (!meta) return;
+      renameTargetLawId = id;
+      const srcObj = (activeLawDoc && activeLawDoc.id === id) ? activeLawDoc : meta;
+      const setVal = (elId, v) => { const el = document.getElementById(elId); if (el) el.value = v || ''; };
+      setVal('renameLawShortInput', srcObj.shortName || srcObj.title);
+      setVal('renameLawTitleInput', srcObj.title);
+      setVal('renameLawSubtitleInput', srcObj.subtitle);
+      openModal('renameLawModal');
+      setTimeout(() => document.getElementById('renameLawShortInput')?.focus(), 40);
+    }
+
+    async function handleRenameLaw(event) {
+      event.preventDefault();
+      if (!currentUser) return;
+      const id = renameTargetLawId;
+      const meta = workspace.lawIndex.find(l => l.id === id);
+      if (!meta) return;
+      const shortName = (document.getElementById('renameLawShortInput')?.value || '').trim();
+      const title = (document.getElementById('renameLawTitleInput')?.value || '').trim();
+      const subtitle = (document.getElementById('renameLawSubtitleInput')?.value || '').trim();
+      if (!shortName || !title) return;
+
+      meta.shortName = shortName;
+      meta.title = title;
+      meta.subtitle = subtitle;
+      if (activeLawDoc && activeLawDoc.id === id) {
+        activeLawDoc.shortName = shortName;
+        activeLawDoc.title = title;
+        activeLawDoc.subtitle = subtitle;
+      }
+
+      closeModal('renameLawModal');
+      renderSidebar();
+      renderHeader(getFilteredArticles().length);
+      scheduleSaveWorkspace(true);
+
+      // Grava só os metadados no documento da lei (merge), sem reescrever os artigos
+      setSyncStatus('saving');
+      try {
+        await setDoc(lawDocRef(currentUser.uid, id), {
+          shortName, title, subtitle, updatedAt: new Date().toISOString()
+        }, { merge: true });
+        setSyncStatus('synced');
+        showToast('Nome da lei atualizado.', 'success');
+      } catch (err) {
+        console.error('Erro ao renomear lei:', err);
+        setSyncStatus('error');
+        showToast('Erro ao salvar o novo nome na nuvem.', 'error');
+      }
     }
 
     function confirmDeleteSubject(subjectId) {
@@ -4170,6 +4521,14 @@
       toggleAnnotatedFilter,
       toggleModsFilter,
       toggleUpdatedFilter,
+      toggleFavoritesFilter,
+      toggleFavoriteArticle,
+      openRenameLawModal,
+      handleRenameLaw,
+      openTocModal,
+      setTocMode,
+      handleTocSearch,
+      goToTocArticle,
       dismissArticleUpdateBadge,
       clearAllUpdateBadges,
       clearFilters,
