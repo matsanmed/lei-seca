@@ -59,18 +59,27 @@
       outline: none;
     }
 
-    /* Garante leitura nítida em trechos grifados tanto no modo claro quanto no escuro */
+    /* Garante leitura nítida em trechos grifados (sem !important, permitindo trocar a cor da letra) */
     .article-body span[style*="background-color"],
     .article-body mark {
-      color: #0f172a !important;
+      color: #0f172a;
       padding: 0.05rem 0.22rem;
       border-radius: 0.25rem;
       box-decoration-break: clone;
       -webkit-box-decoration-break: clone;
     }
+    /* Quando o navegador envolve um trecho grifado com um span de cor de texto, o grifo herda a cor escolhida */
+    .article-body [style^="color:"] span[style*="background-color"],
+    .article-body [style*="; color:"] span[style*="background-color"],
+    .article-body [style*=";color:"] span[style*="background-color"],
+    .article-body [style^="color:"] mark,
+    .article-body [style*="; color:"] mark,
+    .article-body [style*=";color:"] mark {
+      color: inherit;
+    }
     .article-body span[style*="background-color: transparent"],
     .article-body span[style*="background-color: rgba(0, 0, 0, 0)"] {
-      color: inherit !important;
+      color: inherit;
       padding: 0;
     }
 
@@ -3139,10 +3148,68 @@
     function applyTextColor(color) {
       try {
         document.execCommand('styleWithCSS', false, true);
-        const resolved = color === 'default'
-          ? (workspace.preferences.darkMode ? '#e2e8f0' : '#1e293b')
-          : color;
-        document.execCommand('foreColor', false, resolved);
+
+        if (color === 'default') {
+          const bodyEl = editingArticleId ? document.getElementById(`body-${editingArticleId}`) : null;
+          const sel = window.getSelection();
+
+          if (!sel || sel.isCollapsed || !bodyEl) {
+            // Se não houver texto selecionado, verifica se o cursor está dentro de um grifo
+            let inHighlight = false;
+            let cur = sel?.anchorNode?.nodeType === Node.TEXT_NODE ? sel.anchorNode.parentElement : sel?.anchorNode;
+            while (cur && cur !== bodyEl) {
+              const bg = (cur.style?.backgroundColor || '').replace(/\s+/g, '').toLowerCase();
+              if ((bg && bg !== 'transparent' && bg !== 'rgba(0,0,0,0)') || cur.tagName === 'MARK') {
+                inHighlight = true;
+                break;
+              }
+              cur = cur.parentElement;
+            }
+            const fallbackColor = inHighlight
+              ? '#0f172a'
+              : (workspace.preferences.darkMode ? '#e2e8f0' : '#1e293b');
+            document.execCommand('foreColor', false, fallbackColor);
+          } else {
+            // Usa cor sentinela para o navegador dividir exatamente a seleção e depois remove o estilo inline de cor
+            const sentinel = '#010203';
+            document.execCommand('foreColor', false, sentinel);
+
+            bodyEl.querySelectorAll('span, font').forEach(el => {
+              const c = (el.style?.color || '').replace(/\s+/g, '').toLowerCase();
+              const attrC = (el.getAttribute('color') || '').trim().toLowerCase();
+              if (c === 'rgb(1,2,3)' || c === '#010203' || attrC === '#010203') {
+                let hasColoredAncestor = false;
+                let hasHighlight = false;
+                let cur = el;
+                while (cur && cur !== bodyEl) {
+                  const bg = (cur.style?.backgroundColor || '').replace(/\s+/g, '').toLowerCase();
+                  if ((bg && bg !== 'transparent' && bg !== 'rgba(0,0,0,0)') || cur.tagName === 'MARK') {
+                    hasHighlight = true;
+                  }
+                  if (cur !== el && cur.style?.color) {
+                    hasColoredAncestor = true;
+                  }
+                  cur = cur.parentElement;
+                }
+
+                el.removeAttribute('color');
+                if (!hasColoredAncestor) {
+                  el.style.removeProperty('color');
+                  if (!el.getAttribute('style')?.trim()) {
+                    el.removeAttribute('style');
+                  }
+                } else {
+                  el.style.color = hasHighlight
+                    ? '#0f172a'
+                    : (workspace.preferences.darkMode ? '#e2e8f0' : '#1e293b');
+                }
+              }
+            });
+          }
+        } else {
+          document.execCommand('foreColor', false, color);
+        }
+
         if (editingArticleId) handleArticleEditInput(editingArticleId);
       } catch (err) {
         console.error('Erro ao alterar cor:', err);
