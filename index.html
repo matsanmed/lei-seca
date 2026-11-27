@@ -576,7 +576,7 @@
 
     // Anotações legislativas inline do Planalto: "(Redação dada pela...)", "(Incluído pela...)", "(Revogado...)" etc.
     // "Vide ...", "Regulamento" e "Vigência" também entram (aparecem em outra cor no histórico).
-    const MOD_ANNOTATION_SOURCE = '\\((?:Redação dada|Incluíd[oa]|Revogad[oa]|Renumerad[oa]|Transformad[oa]|Alterad[oa]|Suprimid[oa]|Vide|Regulamento|Vigência)[^()]*\\)';
+    const MOD_ANNOTATION_SOURCE = '\\((?:Redação dada|Incluíd[oa]|Revogad[oa]|Renumerad[oa]|Transformad[oa]|Alterad[oa]|Suprimid[oa]|Execução suspensa|Vide|Regulamento|Vigência)[^()]*\\)';
 
     function extractInlineModificationsFromTexts(texts) {
       const MAX_LEN = 2000;
@@ -617,6 +617,52 @@
         }
       });
       return out;
+    }
+
+    // -----------------------------------------------------------------------
+    // TRECHOS RISCADOS (marcados como ~~texto~~): saem do corpo e vão para "Modif."
+    // -----------------------------------------------------------------------
+    function stripAnnotations(text) {
+      return String(text || '').replace(new RegExp(MOD_ANNOTATION_SOURCE, 'gi'), ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    // Separa uma linha em: texto vigente e registros do que foi riscado
+    function splitStruckLine(line) {
+      const struckParts = [];
+      const rest = line.replace(/~~([\s\S]*?)~~/g, (_, t) => { struckParts.push(t); return ' '; })
+        .replace(/~~/g, '').replace(/\s+/g, ' ').trim();
+      const struck = struckParts.join(' ').replace(/\*\*|__/g, '').replace(/\s+/g, ' ').trim();
+
+      // Sobrou só anotação, rótulo ("III -", "§ 2º", "a)") ou pontuação? Então o dispositivo não está vigente
+      const leftover = stripAnnotations(rest)
+        .replace(/^(?:Art\.?\s*\d+[º°o]?(?:-[A-Z0-9]+)?|Parágrafo único|§\s*\d+\s*[º°o]?(?:-[A-Z0-9]+)?|[IVXLCDM]+(?:-[A-Z])?(?=\s*[-–—])|[a-z]\))/, '')
+        .replace(/[\s.;:,\-–—]/g, '');
+      const isDead = !leftover;
+
+      // Se o rótulo ficou fora do risco, mantém a linha inteira no registro
+      const source = isDead ? line.replace(/~~/g, '').replace(/\*\*|__/g, '').replace(/\s+/g, ' ').trim() : struck;
+      const device = stripAnnotations(source);
+      const norms = (source.match(new RegExp(MOD_ANNOTATION_SOURCE, 'gi')) || []).map(n => n.slice(1, -1).trim());
+      return { live: isDead ? '' : rest, device, norms: [...new Set(norms)] };
+    }
+
+    function buildStruckMods(device, norms) {
+      return (norms.length ? norms : ['Redação anterior']).map(norm => ({
+        id: generateId('mod'), kind: 'strike', oldText: device, newText: '', norm, date: ''
+      }));
+    }
+
+    // Junta registros "strike" novos aos que o artigo já tem, sem duplicar
+    function mergeStruckMods(currentMods, incomingMods) {
+      const mods = Array.isArray(currentMods) ? [...currentMods] : [];
+      const keyOf = m => `${normalizeForDiff(m.norm)}|${normalizeForDiff(m.oldText)}`;
+      const seen = new Set(mods.filter(m => m.kind === 'strike').map(keyOf));
+      for (const m of (incomingMods || [])) {
+        if (m.kind !== 'strike' || seen.has(keyOf(m))) continue;
+        seen.add(keyOf(m));
+        mods.push(m);
+      }
+      return mods;
     }
 
     // Artigos repetidos no arquivo (versões antigas): liga cada redação anterior à redação que a substituiu
@@ -667,6 +713,49 @@
       let pendingHeaders = [];
       let currentMajorScope = 'PRINCIPAL'; // Muda para 'ADCT' ao encontrar ADCT
       let insideSignatureBlock = false;
+      let pendingStruck = null; // Artigo riscado aguardando a redação vigente
+      let lastStruck = null;    // Último dispositivo riscado (para anotações que vêm na linha seguinte)
+
+      // Artigo inteiramente revogado: cria um cartão "(Revogado)" para guardar o histórico
+      function flushPendingStruck() {
+        if (!pendingStruck) return;
+        const artObj = {
+          id: generateId('art'),
+          number: pendingStruck.number,
+          sectionHeader: pendingStruck.headers.join(' • '),
+          _scopeKey: pendingStruck.scopeKey,
+          _lines: [`${pendingStruck.label}${/[º°]$/.test(pendingStruck.label) ? '' : '.'} (Revogado)`],
+          _synthetic: true,
+          note: '',
+          modifications: pendingStruck.mods
+        };
+        articles.push(artObj);
+        currentArticle = artObj;
+        pendingStruck = null;
+      }
+
+      function addStruckLine(info) {
+        if (!info.device) return;
+        const label = extractArticleNumberLabel(info.device);
+        const scopeKey = label ? `${currentMajorScope}::${label}` : '';
+        if (label && !(pendingStruck && pendingStruck.scopeKey === scopeKey)
+            && !(currentArticle && currentArticle._scopeKey === scopeKey)) {
+          flushPendingStruck();
+          pendingStruck = {
+            label, scopeKey,
+            number: currentMajorScope === 'ADCT' ? `${label} (ADCT)` : label,
+            headers: pendingHeaders.splice(0),
+            mods: []
+          };
+        }
+        const target = pendingStruck ? pendingStruck.mods
+          : currentArticle ? currentArticle.modifications : null;
+        // Título ou subtítulo riscado não é dispositivo: ignora
+        if (!target || (!isNewClauseStart(info.device) && !label)) return;
+        const mods = buildStruckMods(info.device, info.norms);
+        target.push(...mods);
+        lastStruck = { target, device: info.device, mods };
+      }
 
       function pushLineToCurrentArticle(line) {
         if (!currentArticle) return;
@@ -684,7 +773,32 @@
       }
 
       for (let i = 0; i < cleanedLines.length; i++) {
-        const line = cleanedLines[i];
+        let line = cleanedLines[i];
+
+        if (line.includes('~~') && !insideSignatureBlock) {
+          const info = splitStruckLine(line);
+          addStruckLine(info);
+          if (!info.live) continue;
+          line = info.live;
+        }
+
+        // Linha só com "(Revogado ...)" logo após um dispositivo riscado pertence a ele
+        if (lastStruck && !stripAnnotations(line)) {
+          const norms = (line.match(new RegExp(MOD_ANNOTATION_SOURCE, 'gi')) || []).map(n => n.slice(1, -1).trim());
+          if (norms.length) {
+            // Substitui o registro genérico "Redação anterior", se for o caso
+            lastStruck.mods.filter(m => m.norm === 'Redação anterior').forEach(m => {
+              lastStruck.target.splice(lastStruck.target.indexOf(m), 1);
+            });
+            lastStruck.mods = lastStruck.mods.filter(m => m.norm !== 'Redação anterior');
+            const added = buildStruckMods(lastStruck.device, norms)
+              .filter(n => !lastStruck.mods.some(m => m.norm === n.norm));
+            lastStruck.target.push(...added);
+            lastStruck.mods.push(...added);
+            continue;
+          }
+        }
+        lastStruck = null;
 
         if (/^Brasília\s*,\s*\d+\s+de\s+[a-zç]+\s+de\s+\d{4}/i.test(line)) {
           insideSignatureBlock = true;
@@ -698,6 +812,7 @@
         // O título real do ADCT vem em CAIXA ALTA; a versão em Title Case é só referência/índice
         if (/^ATO DAS DISPOSIÇÕES CONSTITUCIONAIS TRANSITÓRIAS$/.test(line)) {
           insideSignatureBlock = false;
+          flushPendingStruck();
           currentMajorScope = 'ADCT';
           currentArticle = null;
           pendingHeaders = ['ATO DAS DISPOSIÇÕES CONSTITUCIONAIS TRANSITÓRIAS'];
@@ -738,6 +853,16 @@
         const artLabel = extractArticleNumberLabel(line);
         if (artLabel) {
           const scopeKey = `${currentMajorScope}::${artLabel}`;
+          let struckMods = [];
+          if (pendingStruck) {
+            if (pendingStruck.scopeKey === scopeKey) {
+              pendingHeaders = pendingStruck.headers.concat(pendingHeaders);
+              struckMods = pendingStruck.mods;
+              pendingStruck = null;
+            } else {
+              flushPendingStruck();
+            }
+          }
           const prevArt = articles.length > 0 ? articles[articles.length - 1] : null;
 
           // Se o artigo imediatamente anterior tem o MESMO número e mesmo escopo,
@@ -754,6 +879,7 @@
               kind: 'hist'
             });
             prevArt._lines = [line];
+            prevArt.modifications.push(...struckMods);
             currentArticle = prevArt;
             continue;
           }
@@ -769,7 +895,7 @@
             _scopeKey: scopeKey,
             _lines: [line],
             note: '',
-            modifications: []
+            modifications: struckMods
           };
           articles.push(artObj);
           currentArticle = artObj;
@@ -784,6 +910,8 @@
         }
       }
 
+      flushPendingStruck();
+
       return articles.map(a => {
         const html = a._lines.map(l => formatLawLineHtml(l)).join('');
         return {
@@ -797,7 +925,7 @@
           modifications: (() => {
             const hist = a.modifications || [];
             relinkHistoricalVersions(hist, a._lines.join('\n'));
-            return [...hist, ...extractInlineModificationsFromTexts(a._lines)];
+            return [...hist, ...(a._synthetic ? [] : extractInlineModificationsFromTexts(a._lines))];
           })()
         };
       });
@@ -886,16 +1014,6 @@
       // Remove elementos que não são texto da lei
       body.querySelectorAll('script, style, noscript, iframe, nav, form, button, svg, img').forEach(el => el.remove());
 
-      // Equivalente ao "Texto compilado" do Planalto: ignora redações revogadas/riscadas
-      if (ignoreStrikethrough) {
-        body.querySelectorAll('strike, s, del').forEach(el => el.remove());
-        body.querySelectorAll('[style]').forEach(el => {
-          if (/text-decoration[^;]*line-through/i.test(el.getAttribute('style') || '')) {
-            el.remove();
-          }
-        });
-      }
-
       // Normaliza sobrescritos ordinais do Planalto: Art. 1<sup><u>o</u></sup> -> Art. 1º
       body.querySelectorAll('sup').forEach(sup => {
         const txt = (sup.textContent || '').trim().toLowerCase();
@@ -906,6 +1024,25 @@
         }
       });
 
+      // Trechos riscados NÃO são apagados: são marcados com ~~ ~~ para o parser mandá-los a "Modif."
+      if (ignoreStrikethrough) {
+        const isStruck = node => {
+          for (let el = node.parentElement; el; el = el.parentElement) {
+            if (/^(STRIKE|S|DEL)$/.test(el.tagName)) return true;
+            if (/text-decoration[^;]*line-through/i.test(el.getAttribute('style') || '')) return true;
+          }
+          return false;
+        };
+        const walker = docRef.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+        const textNodes = [];
+        while (walker.nextNode()) textNodes.push(walker.currentNode);
+        textNodes.forEach(node => {
+          // Quebras de linha do código-fonte não são quebras de parágrafo
+          const value = node.nodeValue.replace(/[\s\u00A0]+/g, ' ');
+          node.nodeValue = value.trim() && isStruck(node) ? `\u0001${value}\u0002` : value;
+        });
+      }
+
       // Mantém quebras de linha entre parágrafos, incisos e títulos
       body.querySelectorAll('br').forEach(br => br.replaceWith(docRef.createTextNode('\n')));
       body.querySelectorAll('p, div, h1, h2, h3, h4, h5, h6, li, tr, blockquote').forEach(block => {
@@ -915,6 +1052,9 @@
 
       const rawText = (body.textContent || '')
         .replace(/\u00A0/g, ' ')
+        .replace(/\u0002([ \t]*)\u0001/g, '$1')
+        .replace(/\u0001([ \t]*)/g, '$1~~')
+        .replace(/([ \t]*)\u0002/g, '~~$1')
         .replace(/[ \t]+\n/g, '\n')
         .replace(/\n{2,}/g, '\n')
         .trim();
@@ -1242,7 +1382,10 @@
         const oldBaseNorm = normalizeForDiff(stripHtmlToText(oldArt.originalHtml || oldArt.html));
         const newBaseNorm = normalizeForDiff(stripHtmlToText(inc.html));
 
-        if (oldBaseNorm === newBaseNorm) {
+        const hasNewStrikeMods = mergeStruckMods(oldArt.modifications, inc.modifications).length
+          > (oldArt.modifications || []).length;
+
+        if (oldBaseNorm === newBaseNorm && !hasNewStrikeMods) {
           unchangedCount++;
           items.push({
             type: 'unchanged',
@@ -1329,7 +1472,7 @@
           newText: String(m.newText || ''),
           norm: String(m.norm || ''),
           date: String(m.date || ''),
-          ...((m.kind === 'auto' || m.kind === 'hist') ? { kind: m.kind } : {})
+          ...(['auto', 'hist', 'strike'].includes(m.kind) ? { kind: m.kind } : {})
         }));
       }
       return out;
@@ -2363,7 +2506,7 @@
                 </div>
                 <label class="inline-flex items-center gap-2 text-[11px] text-slate-600 dark:text-slate-400 cursor-pointer">
                   <input id="importIgnoreStrike" type="checkbox" checked class="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
-                  <span>Ignorar trechos riscados/revogados (Texto compilado)</span>
+                  <span>Mover trechos riscados/revogados para "Modif." (texto compilado)</span>
                 </label>
               </div>
 
@@ -2513,7 +2656,7 @@
                   </div>
                   <label class="inline-flex items-center gap-2 text-[11px] text-slate-600 dark:text-slate-400 cursor-pointer">
                     <input id="updateIgnoreStrike" type="checkbox" checked class="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500" />
-                    <span>Ignorar trechos riscados/revogados (Texto compilado)</span>
+                    <span>Mover trechos riscados/revogados para "Modif." (texto compilado)</span>
                   </label>
                 </div>
 
@@ -3078,6 +3221,15 @@
       const modsListHtml = hasMods
         ? art.modifications.map(m => {
             const norm = m.norm || '';
+            if (m.kind === 'strike') {
+              return `
+            <div class="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700/80 flex items-start justify-between gap-2">
+              <p class="text-xs text-slate-700 dark:text-slate-200 leading-relaxed"><span class="line-through">${escapeHtml(m.oldText)}</span> <span class="font-bold text-rose-600 dark:text-rose-400">(${escapeHtml(norm)})</span></p>
+              <button type="button" onclick="event.stopPropagation(); deleteModification('${art.id}', '${m.id}')" title="Remover registro"
+                class="text-[11px] text-slate-400 hover:text-rose-500 shrink-0">Remover</button>
+            </div>
+          `;
+            }
             const isRef = /^(Vide|Regulamento|Vigência)/i.test(norm);
             const isRevoked = /^Revogad/i.test(norm);
             const isHist = m.kind === 'hist';
@@ -4730,7 +4882,10 @@
             const autoMod = item.mergeInfo.autoModification;
             const normAutoOld = normalizeForDiff(autoMod.oldText);
             const alreadyRecorded = existingMods.some(m => normalizeForDiff(m.oldText) === normAutoOld);
-            if (!alreadyRecorded && autoMod.oldText) {
+            // Se só mudaram as anotações "(Revogado...)" soltas, não registra "redação anterior"
+            const sameWording = normalizeForDiff(stripAnnotations(stripHtmlToText(item.oldArt.originalHtml || item.oldArt.html)).replace(/\s/g, ''))
+              === normalizeForDiff(stripAnnotations(stripHtmlToText(item.newArt.html)).replace(/\s/g, ''));
+            if (!alreadyRecorded && !sameWording && autoMod.oldText) {
               existingMods.push(autoMod);
             }
 
@@ -4741,7 +4896,7 @@
               originalHtml: item.newArt.html,
               note: item.oldArt.note || '',
               updateBadge: markBadges ? 'updated' : (item.oldArt.updateBadge || ''),
-              modifications: existingMods
+              modifications: mergeStruckMods(existingMods, item.newArt.modifications)
             });
           } else if (item.type === 'new') {
             if (!item.selected) continue;
