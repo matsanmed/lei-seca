@@ -800,6 +800,23 @@
         }
         lastStruck = null;
 
+        // Preâmbulo ("Nós, representantes do povo..."): texto antes do Art. 1º que vira um cartão próprio
+        if (articles.length === 0 && !pendingStruck && /^(?:\*\*|__|\*)?Nós\s*,/.test(line)) {
+          const preamble = {
+            id: generateId('art'),
+            number: 'Preâmbulo',
+            sectionHeader: '',
+            _scopeKey: 'PRINCIPAL::PREÂMBULO',
+            _lines: [line],
+            note: '',
+            modifications: []
+          };
+          pendingHeaders = [];
+          articles.push(preamble);
+          currentArticle = preamble;
+          continue;
+        }
+
         if (/^Brasília\s*,\s*\d+\s+de\s+[a-zç]+\s+de\s+\d{4}/i.test(line)) {
           insideSignatureBlock = true;
           continue;
@@ -903,6 +920,7 @@
         }
 
         if (currentArticle) {
+          if (currentArticle.number === 'Preâmbulo' && pendingHeaders.length > 0) continue;
           if (/^(Texto compilado|Mensagem de veto|ÍNDICE TEMÁTICO|Este texto não substitui)/i.test(line)) {
             continue;
           }
