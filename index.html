@@ -825,6 +825,167 @@
     }
 
     // -----------------------------------------------------------------------
+    // 5C. BUSCADOR DE LEIS POR LINK (PLANALTO E SITES OFICIAIS)
+    // -----------------------------------------------------------------------
+    function saveProxyUrlFromInput(inputId) {
+      const val = (document.getElementById(inputId)?.value || '').trim().replace(/\/+$/, '');
+      workspace.preferences.proxyUrl = val || DEFAULT_PROXY_URL;
+      ['importProxyUrl', 'updateProxyUrl'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el && el.value !== workspace.preferences.proxyUrl) {
+          el.value = workspace.preferences.proxyUrl;
+        }
+      });
+      scheduleSaveWorkspace(true);
+      showToast('URL do buscador salva na nuvem.', 'info');
+    }
+
+    async function fetchHtmlViaProxy(targetUrl) {
+      const cleanTarget = String(targetUrl || '').trim();
+      if (!/^https?:\/\/\S+/i.test(cleanTarget)) {
+        throw new Error('Informe um link válido começando com https:// ou http://.');
+      }
+      const proxyBase = (workspace.preferences.proxyUrl || DEFAULT_PROXY_URL).trim().replace(/\/+$/, '');
+      if (!proxyBase) {
+        throw new Error('Configure a URL do seu Cloudflare Worker em "Configurar Proxy".');
+      }
+      if (!currentUser) {
+        throw new Error('Faça login para usar o buscador.');
+      }
+
+      const idToken = await currentUser.getIdToken();
+      const sep = proxyBase.includes('?') ? '&' : '?';
+      const resp = await fetch(`${proxyBase}${sep}url=${encodeURIComponent(cleanTarget)}`, {
+        headers: {
+          'Authorization': `Bearer ${idToken}`
+        }
+      });
+
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => null);
+        throw new Error(errData?.error || `Falha ao buscar página (HTTP ${resp.status}).`);
+      }
+
+      const bytes = await resp.arrayBuffer();
+      // Tenta UTF-8; se houver bytes inválidos (padrão de leis antigas do Planalto), usa windows-1252
+      try {
+        return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      } catch {
+        return new TextDecoder('windows-1252').decode(bytes);
+      }
+    }
+
+    function extractLawTextFromHtml(html, { ignoreStrikethrough = true } = {}) {
+      const parser = new DOMParser();
+      const docRef = parser.parseFromString(String(html || ''), 'text/html');
+      const suggestedTitle = (docRef.querySelector('title')?.textContent || '').replace(/\s+/g, ' ').trim();
+
+      const body = docRef.body;
+      if (!body) return { text: '', suggestedTitle };
+
+      // Remove elementos que não são texto da lei
+      body.querySelectorAll('script, style, noscript, iframe, nav, form, button, svg, img').forEach(el => el.remove());
+
+      // Equivalente ao "Texto compilado" do Planalto: ignora redações revogadas/riscadas
+      if (ignoreStrikethrough) {
+        body.querySelectorAll('strike, s, del').forEach(el => el.remove());
+        body.querySelectorAll('[style]').forEach(el => {
+          if (/text-decoration[^;]*line-through/i.test(el.getAttribute('style') || '')) {
+            el.remove();
+          }
+        });
+      }
+
+      // Normaliza sobrescritos ordinais do Planalto: Art. 1<sup><u>o</u></sup> -> Art. 1º
+      body.querySelectorAll('sup').forEach(sup => {
+        const txt = (sup.textContent || '').trim().toLowerCase();
+        if (txt === 'o' || txt === 'º' || txt === '°') {
+          sup.replaceWith(docRef.createTextNode('º'));
+        } else if (txt === 'a' || txt === 'ª') {
+          sup.replaceWith(docRef.createTextNode('ª'));
+        }
+      });
+
+      // Mantém quebras de linha entre parágrafos, incisos e títulos
+      body.querySelectorAll('br').forEach(br => br.replaceWith(docRef.createTextNode('\n')));
+      body.querySelectorAll('p, div, h1, h2, h3, h4, h5, h6, li, tr, blockquote').forEach(block => {
+        block.prepend(docRef.createTextNode('\n'));
+        block.append(docRef.createTextNode('\n'));
+      });
+
+      const rawText = (body.textContent || '')
+        .replace(/\u00A0/g, ' ')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{2,}/g, '\n')
+        .trim();
+
+      return { text: rawText, suggestedTitle };
+    }
+
+    async function fetchImportLawFromUrl() {
+      const url = (document.getElementById('importLawUrl')?.value || '').trim();
+      const ignoreStrike = Boolean(document.getElementById('importIgnoreStrike')?.checked);
+      const btn = document.getElementById('importFetchUrlBtn');
+      if (!url) {
+        showToast('Cole o link da lei (ex.: site do Planalto).', 'error');
+        return;
+      }
+
+      if (btn) { btn.disabled = true; btn.textContent = 'Buscando...'; }
+      try {
+        const html = await fetchHtmlViaProxy(url);
+        const { text, suggestedTitle } = extractLawTextFromHtml(html, { ignoreStrikethrough: ignoreStrike });
+        if (!text) throw new Error('A página retornou vazia.');
+
+        const textArea = document.getElementById('importLawRawText');
+        if (textArea) textArea.value = text;
+
+        const titleInput = document.getElementById('importLawTitle');
+        const shortInput = document.getElementById('importLawShortName');
+        if (suggestedTitle) {
+          if (titleInput && !titleInput.value) titleInput.value = suggestedTitle;
+          if (shortInput && !shortInput.value) shortInput.value = suggestedTitle.slice(0, 26);
+        }
+
+        updateImportPreview();
+        showToast('Texto baixado do link! Revise a prévia e clique em Importar.', 'success');
+      } catch (err) {
+        console.error('Erro ao buscar lei por URL:', err);
+        showToast(err.message || 'Não foi possível buscar a lei pelo link.', 'error');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Buscar do link'; }
+      }
+    }
+
+    async function fetchUpdateLawFromUrl() {
+      const url = (document.getElementById('updateLawUrl')?.value || '').trim();
+      const ignoreStrike = Boolean(document.getElementById('updateIgnoreStrike')?.checked);
+      const btn = document.getElementById('updateFetchUrlBtn');
+      if (!url) {
+        showToast('Cole o link da lei para buscar atualizações.', 'error');
+        return;
+      }
+
+      if (btn) { btn.disabled = true; btn.textContent = 'Buscando...'; }
+      try {
+        const html = await fetchHtmlViaProxy(url);
+        const { text } = extractLawTextFromHtml(html, { ignoreStrikethrough: ignoreStrike });
+        if (!text) throw new Error('A página retornou vazia.');
+
+        const textArea = document.getElementById('updateLawRawText');
+        if (textArea) textArea.value = text;
+
+        showToast('Texto baixado! Comparando alterações...', 'info');
+        await analyzeLawUpdate();
+      } catch (err) {
+        console.error('Erro ao buscar atualização por URL:', err);
+        showToast(err.message || 'Não foi possível buscar a atualização pelo link.', 'error');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Buscar e Comparar'; }
+      }
+    }
+    
+    // -----------------------------------------------------------------------
     // 5B. MOTOR DE ATUALIZAÇÃO INTELIGENTE DE LEI (OPÇÃO A — DIFF + MERGE)
     // -----------------------------------------------------------------------
     function canonicalArticleKey(numberStr) {
@@ -4730,7 +4891,10 @@
       applySelectedLawUpdates,
       openBackupModal,
       exportFullBackupJson,
-      handleImportBackupJson
+      handleImportBackupJson,
+      saveProxyUrlFromInput,
+      fetchImportLawFromUrl,
+      fetchUpdateLawFromUrl
     });
 
     // Inicia exibindo tela de verificação enquanto o Firebase Auth checa a sessão
