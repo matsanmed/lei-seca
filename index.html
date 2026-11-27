@@ -1818,7 +1818,7 @@
           fontSize: Number(data.preferences?.fontSize) || 16,
           fontFamily: data.preferences?.fontFamily === 'serif' ? 'serif' : 'sans',
           activeSubjectId: data.preferences?.activeSubjectId || '',
-          activeLawId: data.preferences?.activeLawId || ''
+          activeLawId: data.preferences?.activeLawId || '',
           proxyUrl: data.preferences?.proxyUrl || DEFAULT_PROXY_URL
         };
         workspace.subjects = Array.isArray(data.subjects) ? data.subjects : [];
