@@ -2340,6 +2340,33 @@
                 </div>
               </div>
 
+              <div class="rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 p-3.5 space-y-2.5">
+                <div class="flex items-center justify-between gap-2">
+                  <label class="text-xs font-semibold text-slate-700 dark:text-slate-200">Buscar direto de um link (Planalto ou site oficial)</label>
+                  <details class="text-[11px] text-indigo-600 dark:text-indigo-400">
+                    <summary class="cursor-pointer font-semibold select-none">Configurar Proxy</summary>
+                    <div class="mt-2 flex gap-1.5">
+                      <input id="importProxyUrl" type="url" placeholder="https://planalto-proxy.matsanmed.workers.dev"
+                        class="flex-1 px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-xs text-slate-800 dark:text-slate-100" />
+                      <button type="button" onclick="saveProxyUrlFromInput('importProxyUrl')"
+                        class="px-2.5 py-1.5 rounded-lg bg-indigo-600 text-white font-semibold">Salvar</button>
+                    </div>
+                  </details>
+                </div>
+                <div class="flex flex-col sm:flex-row gap-2">
+                  <input id="importLawUrl" type="url" placeholder="https://www.planalto.gov.br/ccivil_03/leis/l8112cons.htm"
+                    class="flex-1 px-3 py-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                  <button id="importFetchUrlBtn" type="button" onclick="fetchImportLawFromUrl()"
+                    class="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shrink-0 transition-colors">
+                    Buscar do link
+                  </button>
+                </div>
+                <label class="inline-flex items-center gap-2 text-[11px] text-slate-600 dark:text-slate-400 cursor-pointer">
+                  <input id="importIgnoreStrike" type="checkbox" checked class="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
+                  <span>Ignorar trechos riscados/revogados (Texto compilado)</span>
+                </label>
+              </div>
+
               <div>
                 <label class="block text-xs font-semibold text-slate-600 dark:text-slate-300 mb-1">Enviar arquivo .md ou .txt</label>
                 <input id="importFileInput" type="file" accept=".md,.txt,text/plain,text/markdown" onchange="handleImportFileSelected(event)"
@@ -2461,6 +2488,33 @@
                     <li>Em artigos <strong>alterados</strong>, cada inciso/parágrafo igual preserva seus grifos, a redação antiga vai automaticamente para <strong>Modificações</strong> e suas <strong>Observações</strong> nunca são apagadas.</li>
                     <li>Você revisa tudo na tela <strong>Antes × Depois</strong> antes de salvar na nuvem.</li>
                   </ul>
+                </div>
+
+                <div class="rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 p-3.5 space-y-2.5">
+                  <div class="flex items-center justify-between gap-2">
+                    <label class="text-xs font-semibold text-slate-700 dark:text-slate-200">Atualizar direto pelo link (Planalto ou site oficial)</label>
+                    <details class="text-[11px] text-emerald-600 dark:text-emerald-400">
+                      <summary class="cursor-pointer font-semibold select-none">Configurar Proxy</summary>
+                      <div class="mt-2 flex gap-1.5">
+                        <input id="updateProxyUrl" type="url" placeholder="https://planalto-proxy.matsanmed.workers.dev"
+                          class="flex-1 px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-xs text-slate-800 dark:text-slate-100" />
+                        <button type="button" onclick="saveProxyUrlFromInput('updateProxyUrl')"
+                          class="px-2.5 py-1.5 rounded-lg bg-emerald-600 text-white font-semibold">Salvar</button>
+                      </div>
+                    </details>
+                  </div>
+                  <div class="flex flex-col sm:flex-row gap-2">
+                    <input id="updateLawUrl" type="url" placeholder="Cole o link da lei (fica salvo para as próximas atualizações)"
+                      class="flex-1 px-3 py-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500" />
+                    <button id="updateFetchUrlBtn" type="button" onclick="fetchUpdateLawFromUrl()"
+                      class="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shrink-0 transition-colors">
+                      Buscar e Comparar
+                    </button>
+                  </div>
+                  <label class="inline-flex items-center gap-2 text-[11px] text-slate-600 dark:text-slate-400 cursor-pointer">
+                    <input id="updateIgnoreStrike" type="checkbox" checked class="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500" />
+                    <span>Ignorar trechos riscados/revogados (Texto compilado)</span>
+                  </label>
                 </div>
 
                 <div>
@@ -4198,6 +4252,10 @@
       document.getElementById('importLawSubtitle').value = '';
       document.getElementById('importLawRawText').value = '';
       document.getElementById('importFileInput').value = '';
+      const impUrl = document.getElementById('importLawUrl');
+      if (impUrl) impUrl.value = '';
+      const impProxy = document.getElementById('importProxyUrl');
+      if (impProxy) impProxy.value = workspace.preferences.proxyUrl || DEFAULT_PROXY_URL;
       document.getElementById('importProgressBox').classList.add('hidden');
       document.getElementById('importPreviewBox')?.classList.add('hidden');
       const btn = document.getElementById('importSubmitBtn');
@@ -4287,6 +4345,7 @@
       const title = (document.getElementById('importLawTitle')?.value || '').trim();
       const subtitle = (document.getElementById('importLawSubtitle')?.value || '').trim();
       const rawText = (document.getElementById('importLawRawText')?.value || '').trim();
+      const sourceUrl = (document.getElementById('importLawUrl')?.value || '').trim();
       if (!shortName || !title || !rawText) return;
 
       const btn = document.getElementById('importSubmitBtn');
@@ -4322,6 +4381,7 @@
           shortName,
           title,
           subtitle,
+          sourceUrl,
           articles
         };
 
@@ -4342,6 +4402,7 @@
           shortName: newLaw.shortName,
           title: newLaw.title,
           subtitle: newLaw.subtitle,
+          sourceUrl: newLaw.sourceUrl,
           order: workspace.lawIndex.length,
           articleCount: articles.length,
           archived: false
@@ -4384,6 +4445,10 @@
       const rawText = document.getElementById('updateLawRawText');
       if (fileInput) fileInput.value = '';
       if (rawText) rawText.value = '';
+      const urlInput = document.getElementById('updateLawUrl');
+      if (urlInput) urlInput.value = activeLawDoc.sourceUrl || '';
+      const proxyInput = document.getElementById('updateProxyUrl');
+      if (proxyInput) proxyInput.value = workspace.preferences.proxyUrl || DEFAULT_PROXY_URL;
 
       document.getElementById('updateStepInput')?.classList.remove('hidden');
       document.getElementById('updateStepReview')?.classList.add('hidden');
@@ -4696,6 +4761,10 @@
 
         resultArticles.forEach(refreshAutoModifications);
         activeLawDoc.articles = resultArticles;
+        const updatedSourceUrl = (document.getElementById('updateLawUrl')?.value || '').trim();
+        if (updatedSourceUrl) {
+          activeLawDoc.sourceUrl = updatedSourceUrl;
+        }
 
         await saveFullLawToFirestore(currentUser.uid, activeLawDoc, (done, total) => {
           const pct = Math.min(100, Math.round((done / Math.max(1, total)) * 100));
@@ -4711,6 +4780,7 @@
         const meta = workspace.lawIndex.find(l => l.id === activeLawDoc.id);
         if (meta) {
           meta.articleCount = resultArticles.length;
+          if (updatedSourceUrl) meta.sourceUrl = updatedSourceUrl;
           scheduleSaveWorkspace(true);
         }
 
